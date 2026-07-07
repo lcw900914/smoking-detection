@@ -1,0 +1,200 @@
+"""骨架輔助分支:以手腕-鼻子距離時序,用規則推斷動作階段。
+
+計畫書 §4.5:對每個 track 抽取關鍵點,計算 wrist-to-nose 距離
+(以肩寬正規化,對距離/解析度不敏感),依規則推斷:
+
+    S1 舉手:距離在短時間內明顯縮小(手朝臉靠近)
+    S2 嘴部停留:距離 < near_ratio × 肩寬
+    S3 放下:距離自嘴部附近明顯拉大
+
+推斷出的階段餵入既有的 StageStateMachine 檢查 S1→S2→S3 順序與
+S2 停留時長,分數與網路 cycle score 做 late fusion——
+可解釋(畫面直接看得到手到嘴的線)且不需階段標籤訓練。
+"""
+from collections import deque
+from typing import Optional, Tuple
+
+import numpy as np
+
+# COCO 關鍵點索引
+NOSE, L_SHO, R_SHO, L_WRI, R_WRI = 0, 5, 6, 9, 10
+L_HIP, R_HIP = 11, 12
+
+# 繪圖用骨架連線(上半身為主)
+SKELETON_EDGES = [
+    (5, 7), (7, 9), (6, 8), (8, 10),        # 手臂
+    (5, 6), (5, 11), (6, 12), (11, 12),     # 軀幹
+    (0, 5), (0, 6),                          # 頭-肩
+    (11, 13), (13, 15), (12, 14), (14, 16),  # 腿
+]
+
+
+def estimate_orientation(kpts: np.ndarray, kpt_conf: float = 0.3,
+                         nose_conf: float = 0.5) -> str:
+    """由關鍵點推斷人物朝向:"front" / "back" / "unknown"。
+
+    線索(依可靠度排序):
+    1. 肩膀左右順序:COCO 關鍵點有左右語意——正對鏡頭時,
+       人的右肩(kpt 6)在畫面 x 較小側;背對時左右顛倒。
+       需左右肩分離夠大(側面時符號不穩,不採用)。
+    2. 鼻點置信度:背對時鼻子多為低置信的幻覺點。
+    """
+    sho_ok = (kpts[L_SHO, 2] >= kpt_conf and kpts[R_SHO, 2] >= kpt_conf)
+    if sho_ok:
+        dx = float(kpts[R_SHO, 0] - kpts[L_SHO, 0])  # 背對時 > 0
+        # 分離度基準:肩寬與軀幹高取大(側面肩寬被壓縮)
+        scale = float(abs(dx))
+        if kpts[L_HIP, 2] >= kpt_conf and kpts[R_HIP, 2] >= kpt_conf:
+            mid_sho = (kpts[L_SHO, :2] + kpts[R_SHO, :2]) / 2
+            mid_hip = (kpts[L_HIP, :2] + kpts[R_HIP, :2]) / 2
+            scale = max(scale, 0.55 * float(np.linalg.norm(mid_sho - mid_hip)))
+        if scale > 1e-3 and dx > 0.3 * scale:
+            return "back"      # 肩序顛倒且分離明確 → 背對(優先於鼻點)
+    if kpts[NOSE, 2] >= nose_conf:
+        return "front"
+    return "unknown"
+
+
+class SkeletonStageEstimator:
+    """單一 track 的骨架階段推斷器。
+
+    背向棄權:背對鏡頭時,腕-鼻 2D 距離失去意義(深度不可知,
+    打鍵盤/撥頭髮都會投影在頭附近),一律回報 background 且不產生
+    S2 訊號——「沒證據」不等於「有反證」,也不等於「有證據」。
+
+    Args:
+        near_ratio: 腕-鼻距離 < 此比例×身體尺度 視為「手在臉部」(S2)
+        move_ratio: 0.6 秒內距離變化超過此比例 視為舉手/放下
+        kpt_conf: 一般關鍵點最低置信度
+        nose_conf: 鼻點專用門檻(較嚴,背面幻覺鼻點過不了)
+        fps: 取樣率(決定回看視窗)
+    """
+
+    def __init__(self, near_ratio: float = 0.6, move_ratio: float = 0.35,
+                 kpt_conf: float = 0.3, nose_conf: float = 0.5,
+                 min_scale_px: float = 24.0, kpt_err_px: float = 4.0,
+                 fps: float = 10.0):
+        self.near = near_ratio
+        self.move = move_ratio
+        self.kpt_conf = kpt_conf
+        self.nose_conf = nose_conf
+        # 距離自適應:身體尺度太小(太遠)→ 關鍵點雜訊佔比過大,棄權;
+        # 門檻加上「像素誤差 ÷ 尺度」餘裕,越遠的人相對門檻自動放寬
+        self.min_scale_px = min_scale_px
+        self.kpt_err_px = kpt_err_px
+        self.lookback = max(2, int(0.6 * fps))
+        self._hist: deque = deque(maxlen=int(3 * fps))  # d_norm 歷史
+
+    def _body_scale(self, kpts: np.ndarray) -> Optional[float]:
+        """身體尺度基準:max(肩寬, 0.55×軀幹高)。
+
+        側面視角時肩寬被透視壓縮(可縮到近 0),但軀幹高
+        (肩中點→髖中點)對水平旋轉不變,兩者取大以涵蓋正面與側面。
+        """
+        if kpts[L_SHO, 2] < self.kpt_conf or kpts[R_SHO, 2] < self.kpt_conf:
+            return None
+        shoulder_w = float(np.linalg.norm(kpts[L_SHO, :2] - kpts[R_SHO, :2]))
+        scale = shoulder_w
+        if kpts[L_HIP, 2] >= self.kpt_conf and kpts[R_HIP, 2] >= self.kpt_conf:
+            mid_sho = (kpts[L_SHO, :2] + kpts[R_SHO, :2]) / 2
+            mid_hip = (kpts[L_HIP, :2] + kpts[R_HIP, :2]) / 2
+            torso_h = float(np.linalg.norm(mid_sho - mid_hip))
+            scale = max(scale, 0.55 * torso_h)
+        return scale if scale > 1e-3 else None
+
+    def _wrist_nose_dist(self, kpts: np.ndarray) -> Optional[float]:
+        """正規化腕-鼻距離(取左右腕較近者);關鍵點不可見時回傳 None。
+
+        鼻點採較嚴門檻 nose_conf:S2 的語意依賴鼻子位置可信。
+        """
+        if kpts[NOSE, 2] < self.nose_conf:
+            return None
+        scale = self._body_scale(kpts)
+        if scale is None:
+            return None
+        dists = [
+            float(np.linalg.norm(kpts[w, :2] - kpts[NOSE, :2])) / scale
+            for w in (L_WRI, R_WRI) if kpts[w, 2] >= self.kpt_conf
+        ]
+        return min(dists) if dists else None
+
+    def update(self, kpts: Optional[np.ndarray]
+               ) -> Tuple[int, Optional[float], str]:
+        """推入一幀關鍵點 (17, 3),回傳 (stage_id, d_norm, orientation)。
+
+        stage_id 與全專案一致:0=S1、1=S2、2=S3、3=背景。
+        kpts 為 None 或判定背向時棄權:回報背景、不產生 S2。
+        """
+        if kpts is None:
+            self._hist.append(np.nan)
+            return 3, None, "unknown"
+
+        ori = estimate_orientation(kpts, self.kpt_conf, self.nose_conf)
+        if ori == "back":
+            # 背向棄權:2D 腕-鼻距離不可信,不推 S2(也不倒扣)
+            self._hist.append(np.nan)
+            return 3, None, ori
+
+        # 太遠棄權:身體尺度不足,關鍵點量化誤差會淹沒真實距離
+        scale = self._body_scale(kpts)
+        if scale is not None and scale < self.min_scale_px:
+            self._hist.append(np.nan)
+            return 3, None, ori
+
+        d = self._wrist_nose_dist(kpts)
+        if d is None:
+            self._hist.append(np.nan)
+            return 3, None, ori
+        self._hist.append(d)
+
+        # 距離自適應門檻:加上關鍵點像素誤差的相對餘裕
+        # (近距離 scale 大 → 餘裕趨近 0;遠距離自動放寬)
+        near_eff = self.near + self.kpt_err_px / scale
+
+        # S2:手在嘴部
+        if d < near_eff:
+            return 1, d, ori
+
+        # 與 0.6 秒前比較,判斷靠近(S1)或離開(S3)
+        if len(self._hist) > self.lookback:
+            past = self._hist[-1 - self.lookback]
+            if not np.isnan(past):
+                delta = past - d
+                if delta > self.move and d < near_eff + 2 * self.move:
+                    return 0, d, ori   # 明顯縮小且已接近 → S1 舉手
+                if -delta > self.move and past < near_eff + self.move:
+                    return 2, d, ori   # 自嘴部附近明顯拉大 → S3 放下
+        return 3, d, ori
+
+    def reset(self) -> None:
+        self._hist.clear()
+
+
+def draw_skeleton(frame: np.ndarray, kpts: np.ndarray,
+                  stage_id: int = 3, d_norm: Optional[float] = None,
+                  kpt_conf: float = 0.3) -> None:
+    """在影格上就地畫骨架與腕-鼻連線(S2 時紅色高亮)。"""
+    import cv2
+    pts = kpts[:, :2].astype(int)
+    vis = kpts[:, 2] >= kpt_conf
+
+    for a, b in SKELETON_EDGES:
+        if vis[a] and vis[b]:
+            cv2.line(frame, tuple(pts[a]), tuple(pts[b]), (255, 200, 0), 2)
+    for i in range(len(pts)):
+        if vis[i]:
+            cv2.circle(frame, tuple(pts[i]), 3, (0, 255, 255), -1)
+
+    # 腕-鼻距離線:一般黃色、S2(手在嘴部)紅色加粗
+    if vis[NOSE]:
+        wrists = [w for w in (L_WRI, R_WRI) if vis[w]]
+        if wrists:
+            w = min(wrists, key=lambda k: np.linalg.norm(
+                pts[k] - pts[NOSE]))
+            color = (0, 0, 255) if stage_id == 1 else (0, 255, 255)
+            cv2.line(frame, tuple(pts[w]), tuple(pts[NOSE]), color,
+                     3 if stage_id == 1 else 1)
+            if d_norm is not None:
+                mid = ((pts[w] + pts[NOSE]) // 2)
+                cv2.putText(frame, f"{d_norm:.2f}", tuple(mid),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)

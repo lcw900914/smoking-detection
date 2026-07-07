@@ -1,0 +1,62 @@
+# 訓練設定(RTX 2060 6GB VRAM;所有超參數集中於此,不寫死在程式中)
+seed: 42
+
+paths:
+  data_root: ./datasets/processed      # preprocess.py 輸出的 clip jpg 序列
+  feature_root: ./datasets/features    # extract_features.py 輸出的 .npy 特徵
+  teacher_root: ./datasets/teacher     # distill_precompute.py 輸出的 soft labels / 特徵
+  ckpt_dir: ./checkpoints
+  log_dir: ./runs                      # tensorboard
+
+# ---------- 階段一:凍結 backbone,只訓練時序頭(讀離線特徵) ----------
+head:
+  epochs: 60
+  batch_size: 256
+  optimizer: adamw
+  lr: 1.0e-3
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_epochs: 3
+  num_workers: 4
+  loss_weights:
+    stage_ce: 1.0        # 階段 CE(幀級標籤聚合)
+    cycle_bce: 0.5       # 週期頭 BCE
+    fusion_bce: 0.5      # cycle score BCE
+
+# ---------- 階段二:端到端微調(AMP) ----------
+e2e:
+  epochs: 30
+  batch_size: 8
+  grad_accum: 4          # 有效 batch = 32
+  optimizer: adamw
+  lr: 2.0e-4             # head lr;backbone lr = lr * backbone_lr_mult
+  backbone_lr_mult: 0.1
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_epochs: 2
+  amp: true              # torch.cuda.amp 混合精度
+  num_workers: 4
+  loss_weights:
+    stage_ce: 1.0
+    cycle_bce: 0.5
+    fusion_bce: 0.5
+
+# ---------- 知識蒸餾(離線,teacher 與 student 絕不同時佔用 VRAM) ----------
+distill:
+  enabled: false
+  teacher: x3d_m           # pytorchvideo 模型名(Kinetics 預訓練)
+  temperature: 4.0         # logit KD 溫度 τ
+  loss_weights:
+    logit_kd: 1.0
+    feature_kd: 0.5
+  feature_layer: block4    # teacher 中間層名稱(存檔時使用)
+  teacher_feature_dim: 192 # feature KD projection 目標維度
+
+# ---------- 資料增強(訓練時) ----------
+augment:
+  bbox_jitter: 0.08        # 框抖動 ±8% 平移縮放(整個 clip 一致)
+  hflip: 0.5
+  color_jitter: 0.3        # 亮度/對比/飽和度抖動幅度
+
+# VRAM 保護:估計佔用超過此值(GB)時警告並提供降級選項
+vram_warn_gb: 4.0

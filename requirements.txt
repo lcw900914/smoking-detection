@@ -1,0 +1,21 @@
+# 核心(開發環境:RTX 2060 6GB,請安裝對應 CUDA 版本的 torch/torchvision)
+torch>=2.0
+torchvision>=0.15
+numpy
+opencv-python
+pyyaml
+tqdm
+
+# 偵測與追蹤
+ultralytics>=8.0        # YOLOv8 人物偵測 / pose
+supervision>=0.16,<0.30 # ByteTrack 實作(0.30 起移除,屆時改用 trackers 套件)
+
+# 訓練
+tensorboard
+scikit-learn            # 評估指標(F1、混淆矩陣)
+
+# 知識蒸餾 teacher(僅 distill_precompute.py 需要)
+# pytorchvideo
+
+# 測試
+pytest

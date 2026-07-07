@@ -1,0 +1,28 @@
+# 模型結構設定
+backbone:
+  name: resnet18          # 可替換(之後換 CSPPartialNet 時在 models/backbone.py 註冊)
+  pretrained: true
+  out_channels: 128       # 1x1 conv 壓縮後的特徵通道數 C
+
+input_size: 224           # ROI 裁切後輸入邊長
+
+feature:                  # backbone 輸出特徵圖尺寸(input_size=224, stride-8)
+  C: 128
+  H: 28
+  W: 28
+
+buffer:
+  short:                  # 短尺度:單次動作(約 2 秒 @ 8-10 fps)
+    T: 16
+    stride: 1
+  long:                   # 長尺度:週期性重複(約 16-25 秒)
+    T: 16
+    stride: 8
+
+temporal_head:
+  mid_channels: 256       # 1x1 混合後的通道數
+  num_stage_classes: 4    # S1 舉手 / S2 嘴部停留 / S3 放下 / background(S4 併入 background)
+  num_cycle_classes: 2    # 週期性重複 / 非週期
+
+fusion:
+  hidden_dim: 128         # 融合 MLP 隱藏層維度

@@ -1,0 +1,461 @@
+"""抽菸行為偵測 Demo GUI(Tkinter,無額外相依)。
+
+功能:
+- 來源選擇:攝影機編號或影片檔(瀏覽)
+- 模型權重選擇;留空則僅跑偵測+追蹤
+- 即時畫面(框、track ID、階段、P_t 置信度條、警報狀態)
+- 右側面板:每個 track 的置信度進度條與階段
+- 觸發/解除門檻滑桿(即時生效)
+- 警報事件記錄(觸發時同時截圖存 ./alarms)
+
+用法(專案根目錄):
+    python scripts/gui.py
+    python scripts/gui.py --autotest smoke_run/m1_test.mp4   # 自動驗證模式
+"""
+import argparse
+import os
+import queue
+import sys
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, ttk
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import cv2  # noqa: E402
+from PIL import Image, ImageTk  # noqa: E402
+
+from utils import load_config  # noqa: E402
+
+VIDEO_W, VIDEO_H = 800, 600
+DEFAULT_CKPT = "checkpoints/hmdb_e2e_best.pt"
+_STAGE_NAMES = {0: "S1 舉手", 1: "S2 嘴部", 2: "S3 放下", 3: "背景"}
+
+
+class DemoGUI:
+    """主視窗:左側影像、右側追蹤狀態、下方控制列與警報記錄。"""
+
+    def __init__(self, root: tk.Tk,
+                 infer_config: str = "configs/inference.yaml"):
+        self.root = root
+        self.infer_config = infer_config
+        # 門檻初始值只在啟動時讀一次設定檔;之後以使用者輸入為準
+        try:
+            alarm_cfg = load_config(infer_config)["alarm"]
+            self._init_trigger = float(alarm_cfg["trigger_threshold"])
+            self._init_release = float(alarm_cfg["release_threshold"])
+            self._init_min_events = int(alarm_cfg.get("min_events", 3))
+            self._init_move_gate = bool(
+                load_config(infer_config).get("move_gate", {})
+                .get("enabled", True))
+        except Exception:
+            self._init_trigger, self._init_release = 0.75, 0.4
+            self._init_min_events = 3
+            self._init_move_gate = True
+        root.title("抽菸行為偵測 Demo — channel-as-temporal-buffer")
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.pipeline = None
+        self.worker: threading.Thread = None
+        self.running = False
+        self.frame_q: "queue.Queue" = queue.Queue(maxsize=2)
+        self.alarm_q: "queue.Queue" = queue.Queue()
+
+        self._build_layout()
+        self._poll_ui()
+
+        # 啟動時帶到最前(短暫 topmost 再釋放,避免永遠壓住其他視窗)
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(1500, lambda: root.attributes("-topmost", False))
+
+    # ---------- 版面 ----------
+
+    def _build_layout(self):
+        main = ttk.Frame(self.root, padding=6)
+        main.grid(sticky="nsew")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        # 影像格可伸縮:拉大視窗時影像跟著放大(_draw_frame 依實際尺寸縮放)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        # 左:影像畫面
+        # 用 tk.Canvas:要求尺寸固定為初始值,實際顯示隨視窗伸縮——
+        # 若用 Label 顯示,放大後的圖會成為新的最小尺寸(ratchet),
+        # 把下方控制列擠出視窗
+        self.canvas = tk.Canvas(main, background="#222222",
+                                width=VIDEO_W, height=VIDEO_H,
+                                highlightthickness=0)
+        self.canvas.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        self._canvas_item = self.canvas.create_image(
+            VIDEO_W // 2, VIDEO_H // 2, anchor="center")
+        self._show_placeholder("選擇來源後按「開始」(視窗可拉大)")
+
+        # 右:追蹤狀態 + 門檻(固定寬度,文字長度變化不會抖動)
+        side = ttk.LabelFrame(main, text="追蹤狀態", padding=6,
+                              width=680, height=300)
+        side.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        # 注意:內部子元件用 pack 排版,尺寸傳播要用 pack_propagate 關;
+        # grid_propagate 只擋 grid 子元件,關錯了面板仍會隨文字伸縮
+        side.pack_propagate(False)
+        side.grid_propagate(False)
+        self.track_panel = ttk.Frame(side)
+        self.track_panel.pack(fill="both", expand=True)
+
+        # 固定欄位制:預先建好 N 列,track 進出只改文字、不增刪列,
+        # 版面完全靜止(track 閃爍時清單才不會跳動)
+        self.MAX_SLOTS = 8
+        self.slots = []              # [(lbl, bar), ...]
+        for _ in range(self.MAX_SLOTS):
+            row = ttk.Frame(self.track_panel)
+            row.pack(fill="x", pady=2)
+            bar = ttk.Progressbar(row, maximum=1.0, length=90)
+            bar.pack(side="right")
+            lbl = ttk.Label(row, text="—", anchor="w")
+            lbl.pack(side="left", fill="x", expand=True)
+            self.slots.append((lbl, bar))
+        self.tid_slot = {}           # track_id → slot index
+        self.tid_last_seen = {}      # track_id → 最後更新時間(寬限用)
+
+        thr = ttk.LabelFrame(main, text="警報門檻", padding=6)
+        thr.grid(row=1, column=1, sticky="sew", padx=(6, 0))
+        self.trigger_var = tk.DoubleVar(value=self._init_trigger)
+        self.release_var = tk.DoubleVar(value=self._init_release)
+        for text, var in (("觸發", self.trigger_var), ("解除", self.release_var)):
+            row = ttk.Frame(thr)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=text, width=6).pack(side="left")
+            s = ttk.Scale(row, from_=0.0, to=1.0, variable=var,
+                          command=self._apply_thresholds)
+            s.pack(side="left", fill="x", expand=True)
+            lbl = ttk.Label(row, width=5)
+            lbl.pack(side="left")
+            var.trace_add("write",
+                          lambda *_, v=var, l=lbl: l.config(text=f"{v.get():.2f}"))
+            lbl.config(text=f"{var.get():.2f}")
+
+        # 通報次數:手到嘴事件 ≥ N 次才允許紅色警報(即時生效)
+        row = ttk.Frame(thr)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="次數", width=6).pack(side="left")
+        self.min_events_var = tk.IntVar(value=self._init_min_events)
+        ttk.Spinbox(row, from_=1, to=10, width=4,
+                    textvariable=self.min_events_var,
+                    command=self._apply_thresholds).pack(side="left")
+        ttk.Label(row, text=" 次手到嘴才通報").pack(side="left")
+        self.min_events_var.trace_add(
+            "write", lambda *_: self._apply_thresholds())
+
+        # 移動排除開關:走動中(累積移動 ≥ 3 倍身高)不視為抽菸
+        self.move_gate_var = tk.BooleanVar(value=self._init_move_gate)
+        ttk.Checkbutton(thr, text="移動排除(走動中不通報)",
+                        variable=self.move_gate_var,
+                        command=self._apply_thresholds).pack(
+            anchor="w", pady=2)
+
+        # 下:控制列
+        ctrl = ttk.Frame(main, padding=(0, 6))
+        ctrl.grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Label(ctrl, text="來源").pack(side="left")
+        self.source_var = tk.StringVar(value="0")
+        ttk.Entry(ctrl, textvariable=self.source_var, width=32).pack(
+            side="left", padx=4)
+        ttk.Button(ctrl, text="瀏覽…", command=self._browse_video).pack(
+            side="left")
+        ttk.Label(ctrl, text="權重").pack(side="left", padx=(12, 0))
+        self.ckpt_var = tk.StringVar(
+            value=DEFAULT_CKPT if Path(DEFAULT_CKPT).exists() else "")
+        ttk.Entry(ctrl, textvariable=self.ckpt_var, width=36).pack(
+            side="left", padx=4)
+        ttk.Button(ctrl, text="…", width=3, command=self._browse_ckpt).pack(
+            side="left")
+        self.start_btn = ttk.Button(ctrl, text="▶ 開始", command=self.start)
+        self.start_btn.pack(side="left", padx=(12, 2))
+        self.stop_btn = ttk.Button(ctrl, text="■ 停止", command=self.stop,
+                                   state="disabled")
+        self.stop_btn.pack(side="left")
+        self.status_var = tk.StringVar(value="待機")
+        ttk.Label(ctrl, textvariable=self.status_var).pack(side="left",
+                                                           padx=12)
+
+        # 警報記錄
+        log_frame = ttk.LabelFrame(main, text="警報記錄", padding=4)
+        log_frame.grid(row=3, column=0, columnspan=2, sticky="ew")
+        self.log = tk.Listbox(log_frame, height=5)
+        self.log.pack(fill="both", expand=True)
+
+    def _show_placeholder(self, text: str):
+        """在影像區顯示固定像素尺寸的佔位畫面(含提示文字)。"""
+        from PIL import ImageDraw, ImageFont
+        img = Image.new("RGB", (VIDEO_W, VIDEO_H), (34, 34, 34))
+        d = ImageDraw.Draw(img)
+        try:  # PIL 預設字型不含中文,改用微軟正黑體
+            font = ImageFont.truetype("C:/Windows/Fonts/msjh.ttc", 22)
+        except OSError:
+            font = ImageFont.load_default()
+        d.text((VIDEO_W // 2, VIDEO_H // 2), text,
+               fill=(200, 200, 200), anchor="mm", font=font)
+        self._set_canvas_image(ImageTk.PhotoImage(img))
+
+    def _set_canvas_image(self, photo) -> None:
+        """把影像置中放上 canvas(保留參照防 GC)。"""
+        cw = max(self.canvas.winfo_width(), VIDEO_W)
+        ch = max(self.canvas.winfo_height(), VIDEO_H)
+        self.canvas.coords(self._canvas_item, cw // 2, ch // 2)
+        self.canvas.itemconfigure(self._canvas_item, image=photo)
+        self.canvas.image = photo
+
+    # ---------- 控制 ----------
+
+    def _browse_video(self):
+        p = filedialog.askopenfilename(
+            filetypes=[("影片", "*.mp4 *.avi *.mov *.mkv"), ("全部", "*.*")])
+        if p:
+            self.source_var.set(p)
+
+    def _browse_ckpt(self):
+        p = filedialog.askopenfilename(filetypes=[("PyTorch 權重", "*.pt")])
+        if p:
+            self.ckpt_var.set(p)
+
+    def _apply_thresholds(self, _=None):
+        if self.pipeline is not None:
+            self.pipeline.alarm.trigger = self.trigger_var.get()
+            self.pipeline.alarm.release = min(self.release_var.get(),
+                                              self.trigger_var.get() - 0.01)
+            try:  # Spinbox 打字中可能是空字串
+                self.pipeline.min_events = max(1, int(self.min_events_var.get()))
+            except (tk.TclError, ValueError):
+                pass
+            self.pipeline.move_gate_enabled = bool(self.move_gate_var.get())
+
+    def start(self):
+        if self.running:
+            return
+        self.start_btn.config(state="disabled")
+        self.status_var.set("載入模型中…")
+        threading.Thread(target=self._start_worker, daemon=True).start()
+
+    def _start_worker(self):
+        """在背景執行緒載入 pipeline(避免凍住 UI),然後開始處理。"""
+        try:
+            from inference.pipeline import SmokingDetectionPipeline
+            infer_cfg = load_config(self.infer_config)
+            ckpt = self.ckpt_var.get().strip()
+            use_model = bool(ckpt)
+            model_cfg = load_config("configs/model.yaml") if use_model else None
+
+            pipeline = SmokingDetectionPipeline(
+                infer_cfg, model_cfg,
+                ckpt_path=ckpt or None, use_model=use_model)
+            # 警報 callback 導向 GUI 記錄(同時沿用截圖行為)
+            from inference.alarm import default_alarm_callback
+            snap_dir = infer_cfg["alarm"]["snapshot_dir"]
+
+            def gui_callback(tid, P, t, frame):
+                default_alarm_callback(tid, P, t, frame, snapshot_dir=snap_dir)
+                self.alarm_q.put(
+                    time.strftime("%H:%M:%S") +
+                    f"  track {tid} 觸發警報(P={P:.2f}),截圖已存 {snap_dir}")
+            pipeline.alarm.callback = gui_callback
+            self.pipeline = pipeline
+            # 套用目前滑桿值(使用者的調整優先,不被設定檔覆蓋)
+            self._apply_thresholds()
+        except Exception as e:  # 載入失敗回報到 UI
+            self.alarm_q.put(f"[錯誤] 模型載入失敗:{e}")
+            self.root.after(0, lambda: (
+                self.start_btn.config(state="normal"),
+                self.status_var.set("載入失敗")))
+            return
+
+        self.running = True
+        self.root.after(0, lambda: (
+            self.stop_btn.config(state="normal"),
+            self.status_var.set("執行中")))
+        self._video_loop()
+
+    def _video_loop(self):
+        src = self.source_var.get().strip()
+        from inference.stream import VideoSource
+        from inference.pipeline import draw_overlay
+        try:
+            vs = VideoSource(src, **self.pipeline.cfg.get("stream", {}))
+        except Exception as e:
+            self.alarm_q.put(f"[錯誤] 無法開啟來源:{e}")
+            self.running = False
+            self.root.after(0, self._reset_buttons)
+            return
+        self.alarm_q.put(f"[資訊] 來源={vs.kind} fps={vs.fps:.1f}")
+
+        target = self.pipeline.cfg["sampling"]["target_fps"]
+        step = max(1, round(vs.fps / target))   # 檔案:幀計數取樣
+        min_interval = 1.0 / target             # live:時間取樣
+        idx, results = 0, {}
+        last_proc = float("-inf")
+        t_prev = time.time()
+        while self.running:
+            frame, ts = vs.read(timeout=2.0)
+            if frame is None:
+                if vs.is_live:
+                    self.alarm_q.put("[資訊] 等待串流影格(重連中)…")
+                    continue
+                self.alarm_q.put("[資訊] 影片播放結束")
+                break
+            if vs.is_live:
+                do_step = ts - last_proc >= min_interval
+            else:
+                do_step = idx % step == 0
+            if do_step:
+                results = self.pipeline.step(frame, ts)
+                last_proc = ts
+            vis = draw_overlay(frame, results)
+            try:
+                self.frame_q.put_nowait((vis, dict(results)))
+            except queue.Full:
+                pass
+            idx += 1
+            if not vs.is_live:  # 檔案來源:依 fps 節流,模擬即時
+                dt = 1.0 / vs.fps - (time.time() - t_prev)
+                if dt > 0:
+                    time.sleep(dt)
+            t_prev = time.time()
+        vs.release()
+        self.running = False
+        self.root.after(0, self._reset_buttons)
+
+    def stop(self):
+        self.running = False
+        self.status_var.set("停止中…")
+
+    def _reset_buttons(self):
+        self.start_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        self.status_var.set("待機")
+
+    def on_close(self):
+        self.running = False
+        self.root.after(150, self.root.destroy)
+
+    # ---------- UI 更新 ----------
+
+    def _poll_ui(self):
+        try:
+            vis, results = self.frame_q.get_nowait()
+            self._draw_frame(vis)
+            self._update_tracks(results)
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                self.log.insert(0, self.alarm_q.get_nowait())
+        except queue.Empty:
+            pass
+        self.root.after(30, self._poll_ui)
+
+    def _draw_frame(self, bgr):
+        # 依影像區「目前實際尺寸」縮放:拉大視窗畫面就跟著放大
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if cw < 100 or ch < 100:          # 尚未完成佈局時的 fallback
+            cw, ch = VIDEO_W, VIDEO_H
+        h, w = bgr.shape[:2]
+        scale = min(cw / w, ch / h)
+        img = cv2.resize(bgr, (max(1, int(w * scale)),
+                               max(1, int(h * scale))))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        self._set_canvas_image(ImageTk.PhotoImage(Image.fromarray(img)))
+
+    GRACE_SEC = 2.0   # track 短暫消失的寬限:格位保留,避免清單跳動
+
+    def _update_tracks(self, results):
+        now = time.time()
+
+        # 1) 更新在畫面上的 track(必要時分配空格位)
+        for tid, r in sorted(results.items()):
+            if tid not in self.tid_slot:
+                used = set(self.tid_slot.values())
+                free = [i for i in range(self.MAX_SLOTS) if i not in used]
+                if not free:
+                    continue  # 格位滿(>8 人)暫不顯示,不擠掉現有列
+                self.tid_slot[tid] = free[0]
+            self.tid_last_seen[tid] = now
+
+            lbl, bar = self.slots[self.tid_slot[tid]]
+            level = r.get("level", 0.0)
+            lv = ("高" if level >= 0.8 else
+                  "中" if level >= 0.5 else
+                  "低" if level >= 0.2 else "")
+            text = f"ID{tid} {_STAGE_NAMES.get(r['stage'], '?')}"
+            if r.get("orientation") == "back":
+                text += " 背向"
+            if r.get("events"):
+                text += f" {r['events']}次"
+            if lv:
+                text += f" 警戒{lv}"
+            if r.get("unverified"):
+                text += " 無法確認"
+            if r.get("loiter"):
+                text += " 逗留"
+            if r.get("moving"):
+                text += " 移動中"
+            if r["alarm"]:
+                text += " ⚠"
+            lbl.config(text=text)
+            bar["value"] = r["P"]
+
+        # 2) 消失超過寬限的 track 才釋放格位(清成「—」,列不刪除)
+        for tid in [t for t, ts in self.tid_last_seen.items()
+                    if now - ts > self.GRACE_SEC]:
+            slot = self.tid_slot.pop(tid, None)
+            self.tid_last_seen.pop(tid, None)
+            if slot is not None:
+                lbl, bar = self.slots[slot]
+                lbl.config(text="—")
+                bar["value"] = 0.0
+
+
+def _enable_dpi_awareness():
+    """宣告 DPI aware:高分螢幕上畫面不模糊,座標與實體像素一致。"""
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+
+def main():
+    _enable_dpi_awareness()
+    parser = argparse.ArgumentParser(description="抽菸偵測 Demo GUI")
+    parser.add_argument("--autotest", default=None,
+                        help="自動驗證:載入指定影片跑數秒後截圖退出")
+    parser.add_argument("--infer-config", default="configs/inference_hmdb.yaml"
+                        if Path("configs/inference_hmdb.yaml").exists()
+                        else "configs/inference.yaml",
+                        help="推理設定(HMDB 權重用 inference_hmdb.yaml)")
+    args = parser.parse_args()
+
+    root = tk.Tk()
+    app = DemoGUI(root, infer_config=args.infer_config)
+
+    if args.autotest:
+        app.source_var.set(args.autotest)
+        root.after(500, app.start)
+
+        def snap_and_quit():
+            from PIL import ImageGrab
+            root.update_idletasks()
+            x, y = root.winfo_rootx(), root.winfo_rooty()
+            box = (x, y, x + root.winfo_width(), y + root.winfo_height())
+            ImageGrab.grab(box).save("smoke_run/gui_autotest.png")
+            print("[autotest] 截圖已存 smoke_run/gui_autotest.png")
+            app.on_close()
+        root.after(12000, snap_and_quit)
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

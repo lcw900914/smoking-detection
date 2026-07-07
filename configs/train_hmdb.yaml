@@ -1,0 +1,61 @@
+# HMDB51 起步訓練設定(M3):自動標註僅有 clip 級標籤,
+# 階段標籤全為 background,故 stage_ce 權重調低;
+# 主要學習訊號來自 cycle_bce 與 fusion_bce(smoking vs 其他)。
+seed: 42
+
+paths:
+  data_root: D:/datasets/hmdb51/processed
+  feature_root: D:/datasets/hmdb51/features
+  teacher_root: D:/datasets/hmdb51/teacher
+  ckpt_dir: ./checkpoints
+  log_dir: ./runs
+
+head:
+  epochs: 40
+  batch_size: 128          # 特徵 (128, 2048, 28, 28) 前+反向約 3GB,留餘裕給桌面
+  optimizer: adamw
+  lr: 1.0e-3
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_epochs: 3
+  num_workers: 0           # 特徵 batch 大(~1.6GB),多 worker 共享記憶體會撐爆
+                           # Windows 分頁檔(error 1455);mmap 讀取單執行緒已夠快
+  pos_weight: 4.5          # smoking 僅佔約 18%,正類 BCE 加權補償不平衡
+  loss_weights:
+    stage_ce: 0.1          # 無真實階段標籤,只留極小權重避免頭部漂移
+    cycle_bce: 1.0
+    fusion_bce: 1.0
+
+e2e:
+  epochs: 20
+  batch_size: 8
+  grad_accum: 4
+  optimizer: adamw
+  lr: 2.0e-4
+  backbone_lr_mult: 0.1
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_epochs: 2
+  amp: true
+  num_workers: 4
+  loss_weights:
+    stage_ce: 0.1
+    cycle_bce: 1.0
+    fusion_bce: 1.0
+
+distill:
+  enabled: false
+  teacher: x3d_m
+  temperature: 4.0
+  loss_weights:
+    logit_kd: 1.0
+    feature_kd: 0.5
+  feature_layer: block4
+  teacher_feature_dim: 192
+
+augment:
+  bbox_jitter: 0.08
+  hflip: 0.5
+  color_jitter: 0.3
+
+vram_warn_gb: 4.0

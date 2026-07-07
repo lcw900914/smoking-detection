@@ -1,0 +1,84 @@
+# 即時推理管線設定 — HMDB51 權重專用
+# 自動標註無階段標籤 → 階段頭未訓練、狀態機恆為 0,
+# 故單週期分數全交給網路 cycle score(state_machine 權重 0)。
+# 自錄資料(含 S1-S3 標籤)訓練後請改用 inference.yaml。
+detector:
+  model: yolov8s.pt
+  conf: 0.4
+  device: auto            # auto / cuda / cpu
+
+tracker:                  # ByteTrack(supervision 實作)
+  track_activation_threshold: 0.25
+  lost_track_buffer: 30
+  minimum_matching_threshold: 0.8
+
+sampling:
+  target_fps: 10          # 特徵取樣率(8-10 fps),依來源 fps 自動決定每 N 幀取樣
+
+stream:                   # RTSP / 攝影機串流(inference/stream.py)
+  use_tcp: true           # RTSP 走 TCP,避免 UDP 掉包花屏
+  connect_timeout_sec: 5.0
+  reconnect_sec: 3.0      # 斷線重連間隔
+
+escalation:               # 次數警戒等級:以手到嘴事件「次數」逐級升高
+  window_sec: 90          # 滾動視窗
+  min_dwell: 0.5          # S2 停留 ≥ 此秒數才算一次事件
+  min_gap: 2.0            # 事件間最小間隔(避免同一口重複計數)
+  levels: {low: 0.2, mid: 0.5, high: 0.8}   # 1 次 / 2 次 / ≥3 次
+
+move_gate:                # 移動排除(GUI 可開關):走動中不視為抽菸
+  enabled: true
+  max_heights: 3.0        # 視窗內累積移動 ≥ N 倍人物身高 → 排除
+  window_sec: 10.0
+
+loiter:                   # 逗留警告:背對看不到手 + 未大幅移動
+  enabled: true
+  min_duration: 20.0      # 在場觀察秒數
+  move_ratio: 0.6         # 位移 < 此比例×框對角線 視為未移動
+  wrist_vis_max: 0.1      # 手腕可見幀比例 ≤ 此值 視為看不到手
+
+skeleton:                 # 骨架輔助分支(計畫書 §4.5)
+  enabled: true           # 啟用:pose 模型取代偵測器,狀態機改吃骨架階段
+  model: yolov8s-pose.pt
+  near_ratio: 0.9         # 腕-鼻距離 < 此比例×身體尺度 → S2 手在臉部區域
+                          # (持菸時指尖碰唇、腕距鼻仍有一掌+菸長,0.6 會漏)
+  move_ratio: 0.35        # 0.6 秒內變化超過此比例×肩寬 → S1 舉手 / S3 放下
+  kpt_conf: 0.3           # 關鍵點最低置信度
+  nose_conf: 0.5          # 鼻點專用門檻(較嚴):背面幻覺鼻點過不了
+  min_scale_px: 24        # 身體尺度 < 此像素 → 棄權(太遠,關鍵點不可靠)
+  kpt_err_px: 4.0         # 關鍵點像素誤差餘裕(遠距自動放寬相對門檻)
+
+unverified:               # 背向 + 網路分數高 → 橘色「無法確認」警示
+  back_frac: 0.6          # 近期視窗內背向幀比例 ≥ 此值 視為背向
+  window_sec: 5.0
+  net_score_min: 0.7      # 網路分數 ≥ 此值才升橘色(並存 hard case)
+  save_dir: ./hard_cases  # 背向高分案例存檔(重訓資料來源)
+  save_cooldown_sec: 30.0 # 每 track 存檔冷卻,避免重複
+
+roi:
+  ema_beta: 0.8           # 框 EMA 平滑係數
+  aspect_ratio: 0.75      # 3:4(寬:高)
+  upper_body_ratio: 0.6   # 取框上緣至 60% 高度
+  jump_threshold: 0.5     # 框中心跳動超過(相對框對角線)視為異常,沿用前一幀平滑框
+  out_size: 224
+
+state_machine:
+  window_sec: 8.0         # 滑動檢查視窗
+  s2_min_dwell: 0.8       # S2 最短停留秒數
+  weights:                # 單週期分數 = w_sm * 狀態機分數 + w_net * 網路 cycle score
+    state_machine: 0.4    # 骨架規則驅動狀態機(S1→S2→S3 順序 + S2 dwell)
+    network: 0.6          # 喝水也有手到嘴動作,骨架權重略低於網路
+
+alarm:
+  ema_alpha: 0.9          # P_t = 0.9 * P_{t-1} + 0.1 * cycle_score
+  trigger_threshold: 0.6  # HMDB 權重校準:抽菸 P 峰值 0.65-0.98,混淆動作 <0.13
+  release_threshold: 0.3
+  sustain_sec: 2.0        # 短片段(HMDB 多為 4-9 秒)需較短持續時間
+  min_events: 2           # 手到嘴事件 ≥ 此次數才通報(GUI 可調)
+  snapshot_dir: ./alarms  # 觸發時截圖存檔位置
+
+track_recycle_sec: 3.0    # track 消失超過此秒數即回收 buffer 與狀態
+
+output:
+  save_video: false
+  video_path: ./output.mp4
