@@ -590,7 +590,7 @@ class DemoGUI:
 
 
 class ClipPlayer(tk.Toplevel):
-    """警報片段回放視窗:循環播放 mp4。"""
+    """警報片段回放視窗:循環播放 mp4,畫面隨視窗縮放。"""
 
     def __init__(self, master, path: str, title: str):
         super().__init__(master)
@@ -598,8 +598,22 @@ class ClipPlayer(tk.Toplevel):
         self.cap = cv2.VideoCapture(path)
         fps = self.cap.get(cv2.CAP_PROP_FPS) or 10.0
         self.delay = max(30, int(1000 / fps))
-        self.label = tk.Label(self, background="#111")
-        self.label.pack(fill="both", expand=True)
+
+        # 初始尺寸:片源解析度,上限 800 寬(之後可自由拉大縮小)
+        src_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+        src_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+        s = min(1.0, 800 / max(1, src_w))
+        self._init_w, self._init_h = int(src_w * s), int(src_h * s)
+
+        # 用 Canvas:要求尺寸固定為初始值,實際顯示依視窗現況縮放
+        # (Label 會把放大後的圖變成新的最小尺寸,無法縮回)
+        self.canvas = tk.Canvas(self, background="#111111",
+                                width=self._init_w, height=self._init_h,
+                                highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self._item = self.canvas.create_image(
+            self._init_w // 2, self._init_h // 2, anchor="center")
+
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._alive = True
         self.attributes("-topmost", True)
@@ -616,14 +630,18 @@ class ClipPlayer(tk.Toplevel):
             if not ok:
                 self._close()
                 return
+        # 依視窗目前實際尺寸等比縮放(拉大視窗畫面跟著放大)
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if cw < 50 or ch < 50:
+            cw, ch = self._init_w, self._init_h
         h, w = frame.shape[:2]
-        if w > 800:  # 視窗尺寸上限
-            s = 800 / w
-            frame = cv2.resize(frame, (800, int(h * s)))
+        s = min(cw / w, ch / h)
+        frame = cv2.resize(frame, (max(1, int(w * s)), max(1, int(h * s))))
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.label.configure(image=photo)
-        self.label.image = photo
+        self.canvas.coords(self._item, cw // 2, ch // 2)
+        self.canvas.itemconfigure(self._item, image=photo)
+        self.canvas.image = photo
         self.after(self.delay, self._tick)
 
     def _close(self):
