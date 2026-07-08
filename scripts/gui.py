@@ -179,6 +179,11 @@ class DemoGUI:
                         command=self._apply_thresholds).pack(
             anchor="w", pady=2)
 
+        # 診斷訊息開關(預設關):校準時才顯示未計入/未達門檻的原因
+        self.diag_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(thr, text="顯示診斷訊息(校準用)",
+                        variable=self.diag_var).pack(anchor="w", pady=2)
+
         # 下:控制列
         ctrl = ttk.Frame(main, padding=(0, 6))
         ctrl.grid(row=2, column=0, columnspan=2, sticky="ew")
@@ -292,14 +297,21 @@ class DemoGUI:
                     f"  track {tid} 觸發警報(P={P:.2f}),截圖已存 {snap_dir}")
             pipeline.alarm.callback = gui_callback
             # 事件結算通知:每次手放下顯示停留秒數與是否計入(可觀察校準)
-            pipeline.on_event = lambda tid, dwell, counted, reason: \
-                self.alarm_q.put(
-                    time.strftime("%H:%M:%S") +
-                    f"  track {tid} 停留 {dwell:.1f} 秒 → "
-                    f"{'✔ ' if counted else '✘ '}{reason}")
-            # 診斷訊息:手接近臉但未達 S2 門檻(回答「為什麼沒計數」)
-            pipeline.on_log = lambda msg: self.alarm_q.put(
-                time.strftime("%H:%M:%S") + "  " + msg)
+            # 記錄原則:真正辨識到抽菸(✔ 計入)一律顯示;
+            # 未計入原因與門檻診斷只在「顯示診斷訊息」開啟時顯示
+            def log_event(tid, dwell, counted, reason):
+                if counted:
+                    self.alarm_q.put(
+                        time.strftime("%H:%M:%S") +
+                        f"  track {tid} 抽菸動作 停留 {dwell:.1f} 秒 ✔ {reason}")
+                elif self.diag_var.get():
+                    self.alarm_q.put(
+                        time.strftime("%H:%M:%S") +
+                        f"  track {tid} 停留 {dwell:.1f} 秒 ✘ {reason}")
+            pipeline.on_event = log_event
+            pipeline.on_log = lambda msg: (
+                self.alarm_q.put(time.strftime("%H:%M:%S") + "  " + msg)
+                if self.diag_var.get() else None)
             self.pipeline = pipeline
             # 套用目前滑桿值(使用者的調整優先,不被設定檔覆蓋)
             self._apply_thresholds()
