@@ -336,17 +336,14 @@ class DemoGUI:
                     "rec": rec})
             pipeline.alarm.callback = gui_callback
             # 事件結算通知:每次手放下顯示停留秒數與是否計入(可觀察校準)
-            # 記錄原則:真正辨識到抽菸(✔ 計入)一律顯示;
-            # 未計入原因與門檻診斷只在「顯示診斷訊息」開啟時顯示
+            # 記錄原則:預設只顯示「警報觸發」;
+            # 事件計次與未達門檻等過程訊息全部歸入診斷開關
             def log_event(tid, dwell, counted, reason):
-                if counted:
+                if self.diag_var.get():
+                    mark = "✔" if counted else "✘"
                     self.alarm_q.put(
                         time.strftime("%H:%M:%S") +
-                        f"  track {tid} 抽菸動作 停留 {dwell:.1f} 秒 ✔ {reason}")
-                elif self.diag_var.get():
-                    self.alarm_q.put(
-                        time.strftime("%H:%M:%S") +
-                        f"  track {tid} 停留 {dwell:.1f} 秒 ✘ {reason}")
+                        f"  track {tid} 停留 {dwell:.1f} 秒 {mark} {reason}")
             pipeline.on_event = log_event
             pipeline.on_log = lambda msg: (
                 self.alarm_q.put(time.strftime("%H:%M:%S") + "  " + msg)
