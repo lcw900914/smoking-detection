@@ -73,7 +73,7 @@ class SkeletonStageEstimator:
     def __init__(self, near_ratio: float = 0.6, move_ratio: float = 0.35,
                  kpt_conf: float = 0.3, nose_conf: float = 0.5,
                  min_scale_px: float = 24.0, kpt_err_px: float = 4.0,
-                 fps: float = 10.0):
+                 rise_margin: float = 0.5, fps: float = 10.0):
         self.near = near_ratio
         self.move = move_ratio
         self.kpt_conf = kpt_conf
@@ -82,6 +82,17 @@ class SkeletonStageEstimator:
         # 門檻加上「像素誤差 ÷ 尺度」餘裕,越遠的人相對門檻自動放寬
         self.min_scale_px = min_scale_px
         self.kpt_err_px = kpt_err_px
+        # 「由遠而近」武裝機制:S2 只在手曾離臉 ≥ near+rise_margin 後採信。
+        # 手被遮擋(背在身後/插口袋)時,姿態模型會以高置信度把腕點
+        # 幻覺在身體輪廓上(衣領附近,d≈0.7),恰好落在門檻內——
+        # 但幻覺點永遠不會「先遠離再靠近」,真的舉手一定會。
+        self.rise_margin = rise_margin
+        self._armed = False    # 手已離臉夠遠,下次進入臉部區域可信
+        self._in_s2 = False    # 進行中的可信 S2
+        # 腕點連續不可見(手出畫面/垂下)≥ 此幀數亦視為離臉 → 武裝;
+        # 幻覺腕點恆定「可見」,不會走這條路
+        self._none_arm_frames = max(2, int(0.5 * fps))
+        self._none_count = 0
         self.lookback = max(2, int(0.6 * fps))
         self._hist: deque = deque(maxlen=int(3 * fps))  # d_norm 歷史
 
@@ -143,17 +154,32 @@ class SkeletonStageEstimator:
 
         d = self._wrist_nose_dist(kpts)
         if d is None:
+            # 正面但量不到腕-鼻距離(手出畫面/垂下未偵測):
+            # 持續一段時間即可武裝——手顯然不在臉部
+            self._none_count += 1
+            if self._none_count >= self._none_arm_frames:
+                self._armed = True
+                self._in_s2 = False
             self._hist.append(np.nan)
             return 3, None, ori
+        self._none_count = 0
         self._hist.append(d)
 
         # 距離自適應門檻:加上關鍵點像素誤差的相對餘裕
         # (近距離 scale 大 → 餘裕趨近 0;遠距離自動放寬)
         near_eff = self.near + self.kpt_err_px / scale
 
-        # S2:手在嘴部
+        # S2:手在嘴部——僅在「由遠而近」(armed)時採信;
+        # 每口之間手須放回遠處(≥ near+rise_margin)才能再武裝
         if d < near_eff:
-            return 1, d, ori
+            if self._in_s2 or self._armed:
+                self._in_s2 = True
+                self._armed = False
+                return 1, d, ori
+            return 3, d, ori   # 手在臉部但未經舉手:視為遮擋誤定位,不採信
+        self._in_s2 = False
+        if d >= near_eff + self.rise_margin:
+            self._armed = True  # 手已離臉夠遠
 
         # 與 0.6 秒前比較,判斷靠近(S1)或離開(S3)
         if len(self._hist) > self.lookback:
@@ -168,6 +194,9 @@ class SkeletonStageEstimator:
 
     def reset(self) -> None:
         self._hist.clear()
+        self._armed = False
+        self._in_s2 = False
+        self._none_count = 0
 
 
 def draw_skeleton(frame: np.ndarray, kpts: np.ndarray,

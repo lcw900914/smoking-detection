@@ -39,6 +39,7 @@ skeleton:                 # 骨架輔助分支(計畫書 §4.5,late fusion)
   nose_conf: 0.5          # 鼻點專用門檻(背面幻覺鼻點過不了)
   min_scale_px: 24        # 身體尺度 < 此像素 → 棄權(太遠)
   kpt_err_px: 4.0         # 關鍵點像素誤差餘裕(遠距自動放寬)
+  rise_margin: 0.5        # S2 須「由遠而近」(防手遮擋時的腕點幻覺)
 
 move_gate:                # 移動排除(GUI 可開關)
   enabled: true

@@ -55,6 +55,7 @@ class TestOrientation:
 class TestStages:
     def test_s2_when_hand_at_mouth(self):
         est = SkeletonStageEstimator(near_ratio=0.6, fps=10)
+        est.update(make_kpts(200))                  # 手在遠處 → 武裝
         stage, d, ori = est.update(make_kpts(30))   # d_norm = 0.3 < 0.6
         assert stage == S2 and ori == "front"
         assert d == pytest.approx(0.3)
@@ -74,6 +75,7 @@ class TestStages:
     def test_s3_on_leave(self):
         """手自嘴部離開下降 → S3 放下。"""
         est = SkeletonStageEstimator(near_ratio=0.6, move_ratio=0.35, fps=10)
+        est.update(make_kpts(200))                  # 武裝
         for _ in range(8):
             est.update(make_kpts(40))
         for dist in np.linspace(40, 150, 8):
@@ -162,10 +164,79 @@ class TestDistanceAdaptive:
                                           min_scale_px=24, fps=10)
         far_est = SkeletonStageEstimator(near_ratio=0.9, kpt_err_px=4.0,
                                          min_scale_px=24, fps=10)
+        near_est.update(make_kpts(400, shoulder_w=200))   # 武裝
+        far_est.update(make_kpts(80, shoulder_w=40))      # 武裝
         stage_near, _, _ = near_est.update(make_kpts(190, shoulder_w=200))
         stage_far, _, _ = far_est.update(make_kpts(38, shoulder_w=40))
         assert stage_near == BG
         assert stage_far == S2
+
+
+class TestRiseArming:
+    """S2「由遠而近」武裝機制:防手被遮擋時的高置信腕點幻覺。"""
+
+    def test_hallucinated_hover_never_s2(self):
+        """腕點幻覺在衣領附近(d≈0.74 恆定,從未遠離)→ 永不判 S2。
+
+        重現實測誤報:雙手背在身後,姿態模型以 conf 0.9+ 把腕點
+        放在身體輪廓上,距離恰好落在門檻內。
+        """
+        est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)
+        for _ in range(50):                     # 5 秒恆定懸停
+            stage, d, _ = est.update(make_kpts(74))   # d = 0.74
+            assert stage != S2
+
+    def test_armed_puff_detected(self):
+        """真的舉手(由遠而近)→ S2 正常判定。"""
+        est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)
+        est.update(make_kpts(200))              # d=2.0 遠 → 武裝
+        stage, _, _ = est.update(make_kpts(50))  # d=0.5
+        assert stage == S2
+
+    def test_rearm_required_between_puffs(self):
+        """兩口之間手須放回遠處;只退到中距離再靠近 → 不採信。"""
+        est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)
+        est.update(make_kpts(200))              # 武裝
+        assert est.update(make_kpts(50))[0] == S2    # 第一口
+        est.update(make_kpts(110))              # 只退到 d=1.1(< 1.4 未武裝)
+        assert est.update(make_kpts(50))[0] != S2    # 不採信
+        est.update(make_kpts(200))              # 放回遠處 → 再武裝
+        assert est.update(make_kpts(50))[0] == S2    # 第二口
+
+    def test_ongoing_s2_survives_within_episode(self):
+        """進行中的 S2 持續有效(不因 armed 消耗而中斷)。"""
+        est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)
+        est.update(make_kpts(200))
+        for _ in range(20):                     # 停留 2 秒
+            stage, _, _ = est.update(make_kpts(50))
+            assert stage == S2
+
+    def test_reset_clears_arming(self):
+        est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)
+        est.update(make_kpts(200))
+        est.reset()
+        assert est.update(make_kpts(50))[0] != S2
+
+    def test_invisible_wrist_arms(self):
+        """腕點持續不可見(手出畫面/垂下)≥0.5 秒 → 武裝。
+
+        特寫鏡頭手放下即出畫面,量不到「遠」,以不可見代替。
+        """
+        est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)
+        k_no_wrist = make_kpts(50)
+        k_no_wrist[R_WRI, 2] = 0.1              # 腕點不可見
+        for _ in range(6):                      # 0.6 秒
+            est.update(k_no_wrist)
+        assert est.update(make_kpts(50))[0] == S2   # 已武裝 → 可信 S2
+
+    def test_brief_invisible_wrist_does_not_arm(self):
+        """腕點只消失 1-2 幀(偵測閃爍)不武裝,幻覺懸停仍擋得住。"""
+        est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)
+        k_no_wrist = make_kpts(74)
+        k_no_wrist[R_WRI, 2] = 0.1
+        for _ in range(30):                     # 幻覺懸停,偶爾閃 1 幀
+            assert est.update(make_kpts(74))[0] != S2
+            est.update(k_no_wrist)              # 單幀不可見,不足以武裝
 
 
 def test_alarm_allow_trigger_gate():

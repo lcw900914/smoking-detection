@@ -183,6 +183,7 @@ class SmokingDetectionPipeline:
                     nose_conf=self.skel_cfg.get("nose_conf", 0.5),
                     min_scale_px=self.skel_cfg.get("min_scale_px", 24.0),
                     kpt_err_px=self.skel_cfg.get("kpt_err_px", 4.0),
+                    rise_margin=self.skel_cfg.get("rise_margin", 0.5),
                     fps=self.cfg["sampling"]["target_fps"])
                 lo = self.cfg.get("loiter", {})
                 if lo.get("enabled", True):
@@ -397,10 +398,15 @@ class SmokingDetectionPipeline:
             duration = st.approach_last_t - st.approach_start_t
             if (not st.approach_saw_s2 and duration >= 0.5
                     and self.on_log is not None):
-                self.on_log(
-                    f"track {tid} 手接近臉 {duration:.1f} 秒,"
-                    f"最近距離 {st.approach_min_d:.2f} 未達門檻 {near:.2f}"
-                    f" → 未開始計時")
+                if st.approach_min_d < near:
+                    self.on_log(
+                        f"track {tid} 手在臉部 {duration:.1f} 秒但未經舉手"
+                        f"動作(疑似手被遮擋、腕點誤定位)→ 不採信")
+                else:
+                    self.on_log(
+                        f"track {tid} 手接近臉 {duration:.1f} 秒,"
+                        f"最近距離 {st.approach_min_d:.2f} 未達門檻 {near:.2f}"
+                        f" → 未開始計時")
             st.approach_active = False
 
     def set_dwell_window(self, min_dwell: float, max_dwell: float) -> None:
