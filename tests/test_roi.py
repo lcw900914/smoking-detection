@@ -29,6 +29,32 @@ class TestROISmoother:
         out = sm.update(1, np.array([100, 100, 110, 110], dtype=np.float32))
         assert np.allclose(out, first)
 
+    def test_persistent_jump_recovers(self):
+        """連續拒絕超過上限 → 接受新框(目標真的移走,框不得永久卡死)。"""
+        sm = ROISmoother(beta=0.8, jump_threshold=0.5, max_rejects=3)
+        sm.update(1, np.array([0, 0, 10, 10], dtype=np.float32))
+        far = np.array([100, 100, 110, 110], dtype=np.float32)
+        for _ in range(3):                    # 前 3 次被拒
+            out = sm.update(1, far)
+            assert np.allclose(out, [0, 0, 10, 10])
+        out = sm.update(1, far)               # 第 4 次:跳到新框
+        assert np.allclose(out, far)
+        # 之後在新位置正常平滑
+        out = sm.update(1, np.array([102, 102, 112, 112], dtype=np.float32))
+        assert 100 < out[0] < 102
+
+    def test_reject_counter_resets_on_normal_update(self):
+        """正常更新會清零拒絕計數(偶發跳動不累積成重置)。"""
+        sm = ROISmoother(beta=0.8, jump_threshold=0.5, max_rejects=3)
+        base = np.array([0, 0, 10, 10], dtype=np.float32)
+        far = np.array([100, 100, 110, 110], dtype=np.float32)
+        sm.update(1, base)
+        for _ in range(5):                    # 跳動與正常交錯
+            sm.update(1, far)
+            sm.update(1, base)
+        out = sm.update(1, far)               # 單次跳動仍被拒
+        assert np.allclose(out[:2], [0, 0], atol=2)
+
     def test_per_track_independent(self):
         sm = ROISmoother(beta=0.8)
         a = sm.update(1, np.array([0, 0, 10, 10], dtype=np.float32))

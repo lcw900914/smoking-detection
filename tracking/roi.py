@@ -13,18 +13,25 @@ import numpy as np
 class ROISmoother:
     """逐 track 的框 EMA 平滑器。
 
-    smoothed = β * prev + (1-β) * new;跳動異常時忽略新框。
+    smoothed = β * prev + (1-β) * new;單次跳動異常時忽略新框,
+    但連續拒絕超過 max_rejects 次即視為「真實位移」(偵測閃爍後
+    人已走遠、或 ID 重配),直接跳到新框——否則框會永久卡死在
+    舊位置,ROI 跟著裁錯地方。
     """
 
-    def __init__(self, beta: float = 0.8, jump_threshold: float = 0.5):
+    def __init__(self, beta: float = 0.8, jump_threshold: float = 0.5,
+                 max_rejects: int = 3):
         """
         Args:
             beta: EMA 係數(越大越平滑)
             jump_threshold: 新框中心位移超過(前一框對角線 × 此值)視為異常
+            max_rejects: 連續拒絕上限,超過即接受新框重置
         """
         self.beta = beta
         self.jump_threshold = jump_threshold
+        self.max_rejects = max_rejects
         self._state: Dict[int, np.ndarray] = {}  # track_id → 平滑框 xyxy
+        self._rejects: Dict[int, int] = {}       # track_id → 連續拒絕次數
 
     def update(self, track_id: int, bbox: np.ndarray) -> np.ndarray:
         """更新並回傳平滑後的框 (x1, y1, x2, y2)。"""
@@ -32,16 +39,24 @@ class ROISmoother:
         prev = self._state.get(track_id)
         if prev is None:
             self._state[track_id] = bbox.copy()
+            self._rejects[track_id] = 0
             return bbox.copy()
 
         # 跳動檢查:中心位移相對前一框對角線
         pc = np.array([(prev[0] + prev[2]) / 2, (prev[1] + prev[3]) / 2])
         nc = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
         diag = float(np.hypot(prev[2] - prev[0], prev[3] - prev[1]))
-        if diag > 0 and float(np.linalg.norm(nc - pc)) > self.jump_threshold * diag:
-            # 異常跳動:沿用前一幀平滑框
-            return prev.copy()
+        if diag > 0 and \
+                float(np.linalg.norm(nc - pc)) > self.jump_threshold * diag:
+            self._rejects[track_id] = self._rejects.get(track_id, 0) + 1
+            if self._rejects[track_id] <= self.max_rejects:
+                return prev.copy()   # 偶發跳動:沿用前一幀平滑框
+            # 連續多次「跳動」= 目標真的移走了:跳到新框重新開始
+            self._state[track_id] = bbox.copy()
+            self._rejects[track_id] = 0
+            return bbox.copy()
 
+        self._rejects[track_id] = 0
         smoothed = self.beta * prev + (1.0 - self.beta) * bbox
         self._state[track_id] = smoothed
         return smoothed.copy()
@@ -49,9 +64,11 @@ class ROISmoother:
     def remove(self, track_id: int) -> None:
         """track 回收時移除其平滑狀態。"""
         self._state.pop(track_id, None)
+        self._rejects.pop(track_id, None)
 
     def reset(self) -> None:
         self._state.clear()
+        self._rejects.clear()
 
 
 def upper_body_box(bbox: np.ndarray, aspect_ratio: float = 0.75,
