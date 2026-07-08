@@ -19,8 +19,9 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -67,6 +68,18 @@ class DemoGUI:
         self.running = False
         self.frame_q: "queue.Queue" = queue.Queue(maxsize=2)
         self.alarm_q: "queue.Queue" = queue.Queue()
+
+        # 警報片段錄製:滾動保留最近 ~10 秒取樣影格(縮小節省記憶體),
+        # 警報觸發時連同後續 4 秒寫成 mp4,供記錄點擊回放
+        self.CLIP_PRE_FRAMES = 100     # 約 10 秒 @10fps
+        self.CLIP_POST_SEC = 4.0
+        self.clip_buffer: deque = deque(maxlen=self.CLIP_PRE_FRAMES)
+        self._active_recs = []         # 錄製中的警報片段
+
+        # 條列式記錄(分頁)
+        self.log_entries = []          # 最新在前;{'text', 'rec'}
+        self.PAGE_SIZE = 8
+        self.page = 1
 
         self._build_layout()
         self._poll_ui()
@@ -209,11 +222,30 @@ class DemoGUI:
         ttk.Label(ctrl, textvariable=self.status_var).pack(side="left",
                                                            padx=12)
 
-        # 警報記錄
-        log_frame = ttk.LabelFrame(main, text="警報記錄", padding=4)
+        # 警報記錄:條列式 + 分頁;警報項目可雙擊回放片段
+        log_frame = ttk.LabelFrame(main, text="警報記錄(雙擊警報項目可回放片段)",
+                                   padding=4)
         log_frame.grid(row=3, column=0, columnspan=2, sticky="ew")
-        self.log = tk.Listbox(log_frame, height=5)
+        self.log = tk.Listbox(log_frame, height=6)
         self.log.pack(fill="both", expand=True)
+        self.log.bind("<Double-Button-1>", self._on_log_dclick)
+
+        pager = ttk.Frame(log_frame)
+        pager.pack(fill="x", pady=(4, 0))
+        ttk.Button(pager, text="◀ 上一頁", width=8,
+                   command=lambda: self._goto_page(self.page - 1)).pack(
+            side="left")
+        ttk.Label(pager, text=" 第").pack(side="left")
+        self.page_var = tk.IntVar(value=1)
+        self.page_spin = ttk.Spinbox(
+            pager, from_=1, to=1, width=4, textvariable=self.page_var,
+            command=lambda: self._goto_page(self.page_var.get()))
+        self.page_spin.pack(side="left", padx=2)
+        self.page_total_lbl = ttk.Label(pager, text="/ 1 頁")
+        self.page_total_lbl.pack(side="left")
+        ttk.Button(pager, text="下一頁 ▶", width=8,
+                   command=lambda: self._goto_page(self.page + 1)).pack(
+            side="left", padx=(8, 0))
 
     def _show_placeholder(self, text: str):
         """在影像區顯示固定像素尺寸的佔位畫面(含提示文字)。"""
@@ -292,9 +324,16 @@ class DemoGUI:
 
             def gui_callback(tid, P, t, frame):
                 default_alarm_callback(tid, P, t, frame, snapshot_dir=snap_dir)
-                self.alarm_q.put(
-                    time.strftime("%H:%M:%S") +
-                    f"  track {tid} 觸發警報(P={P:.2f}),截圖已存 {snap_dir}")
+                # 開始錄警報片段:帶入觸發前的緩衝影格,續錄 POST 秒
+                rec = {"tid": tid, "trigger_t": t,
+                       "end_t": t + self.CLIP_POST_SEC,
+                       "frames": list(self.clip_buffer), "path": None}
+                self._active_recs.append(rec)
+                self.alarm_q.put({
+                    "text": time.strftime("%H:%M:%S") +
+                            f"  ⚠ track {tid} 觸發抽菸警報(P={P:.2f})"
+                            f" — 雙擊回放片段",
+                    "rec": rec})
             pipeline.alarm.callback = gui_callback
             # 事件結算通知:每次手放下顯示停留秒數與是否計入(可觀察校準)
             # 記錄原則:真正辨識到抽菸(✔ 計入)一律顯示;
@@ -363,6 +402,8 @@ class DemoGUI:
                 results = self.pipeline.step(frame, ts)
                 last_proc = ts
             vis = draw_overlay(frame, results)
+            if do_step:
+                self._record_clip_frame(vis, ts)
             try:
                 self.frame_q.put_nowait((vis, dict(results)))
             except queue.Full:
@@ -399,12 +440,94 @@ class DemoGUI:
             self._update_tracks(results)
         except queue.Empty:
             pass
+        changed = False
         try:
             while True:
-                self.log.insert(0, self.alarm_q.get_nowait())
+                item = self.alarm_q.get_nowait()
+                if isinstance(item, str):
+                    item = {"text": item, "rec": None}
+                self.log_entries.insert(0, item)  # 最新在前
+                changed = True
         except queue.Empty:
             pass
+        if changed:
+            self._render_log()
         self.root.after(30, self._poll_ui)
+
+    # ---------- 警報片段錄製 ----------
+
+    def _record_clip_frame(self, vis, ts):
+        """收一張取樣影格進滾動緩衝(縮小到寬 ≤960 節省記憶體),
+        並推進進行中的警報片段錄製。"""
+        h, w = vis.shape[:2]
+        if w > 960:
+            s = 960 / w
+            vis = cv2.resize(vis, (960, int(h * s)))
+        self.clip_buffer.append(vis)
+        for rec in self._active_recs[:]:
+            rec["frames"].append(vis)
+            if ts >= rec["end_t"]:
+                self._active_recs.remove(rec)
+                threading.Thread(target=self._write_clip, args=(rec,),
+                                 daemon=True).start()
+
+    def _write_clip(self, rec):
+        """把警報片段寫成 mp4(背景執行緒)。"""
+        frames = rec["frames"]
+        if not frames:
+            return
+        clip_dir = Path("alarms/clips")
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = clip_dir / f"alarm_track{rec['tid']}_{stamp}.mp4"
+        h, w = frames[0].shape[:2]
+        vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
+                             10.0, (w, h))
+        for f in frames:
+            if f.shape[:2] != (h, w):
+                f = cv2.resize(f, (w, h))
+            vw.write(f)
+        vw.release()
+        rec["path"] = str(path)
+
+    # ---------- 條列式記錄(分頁)與回放 ----------
+
+    def _total_pages(self) -> int:
+        return max(1, -(-len(self.log_entries) // self.PAGE_SIZE))
+
+    def _goto_page(self, page: int):
+        self.page = min(max(1, int(page)), self._total_pages())
+        self._render_log()
+
+    def _render_log(self):
+        total = self._total_pages()
+        self.page = min(self.page, total)
+        self.page_var.set(self.page)
+        self.page_spin.configure(to=total)
+        self.page_total_lbl.config(text=f"/ {total} 頁"
+                                        f"(共 {len(self.log_entries)} 筆)")
+        self.log.delete(0, tk.END)
+        start = (self.page - 1) * self.PAGE_SIZE
+        for entry in self.log_entries[start:start + self.PAGE_SIZE]:
+            self.log.insert(tk.END, entry["text"])
+
+    def _on_log_dclick(self, _event):
+        sel = self.log.curselection()
+        if not sel:
+            return
+        idx = (self.page - 1) * self.PAGE_SIZE + sel[0]
+        if idx >= len(self.log_entries):
+            return
+        rec = self.log_entries[idx].get("rec")
+        if rec is None:
+            return                      # 非警報項目
+        if rec.get("path") is None:
+            messagebox.showinfo("片段錄製中",
+                                "警報片段還在錄製(觸發後續錄 4 秒),"
+                                "請稍候再點。")
+            return
+        ClipPlayer(self.root, rec["path"],
+                   f"track {rec['tid']} 抽菸警報片段")
 
     def _draw_frame(self, bgr):
         # 依影像區「目前實際尺寸」縮放:拉大視窗畫面就跟著放大
@@ -467,6 +590,49 @@ class DemoGUI:
                 lbl, bar = self.slots[slot]
                 lbl.config(text="—")
                 bar["value"] = 0.0
+
+
+class ClipPlayer(tk.Toplevel):
+    """警報片段回放視窗:循環播放 mp4。"""
+
+    def __init__(self, master, path: str, title: str):
+        super().__init__(master)
+        self.title(title)
+        self.cap = cv2.VideoCapture(path)
+        fps = self.cap.get(cv2.CAP_PROP_FPS) or 10.0
+        self.delay = max(30, int(1000 / fps))
+        self.label = tk.Label(self, background="#111")
+        self.label.pack(fill="both", expand=True)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._alive = True
+        self.attributes("-topmost", True)
+        self.after(500, lambda: self.attributes("-topmost", False))
+        self._tick()
+
+    def _tick(self):
+        if not self._alive:
+            return
+        ok, frame = self.cap.read()
+        if not ok:  # 播完 → 從頭循環
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self.cap.read()
+            if not ok:
+                self._close()
+                return
+        h, w = frame.shape[:2]
+        if w > 800:  # 視窗尺寸上限
+            s = 800 / w
+            frame = cv2.resize(frame, (800, int(h * s)))
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.label.configure(image=photo)
+        self.label.image = photo
+        self.after(self.delay, self._tick)
+
+    def _close(self):
+        self._alive = False
+        self.cap.release()
+        self.destroy()
 
 
 def _enable_dpi_awareness():
