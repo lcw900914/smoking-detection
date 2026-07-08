@@ -297,6 +297,9 @@ class DemoGUI:
                     time.strftime("%H:%M:%S") +
                     f"  track {tid} 停留 {dwell:.1f} 秒 → "
                     f"{'✔ ' if counted else '✘ '}{reason}")
+            # 診斷訊息:手接近臉但未達 S2 門檻(回答「為什麼沒計數」)
+            pipeline.on_log = lambda msg: self.alarm_q.put(
+                time.strftime("%H:%M:%S") + "  " + msg)
             self.pipeline = pipeline
             # 套用目前滑桿值(使用者的調整優先,不被設定檔覆蓋)
             self._apply_thresholds()

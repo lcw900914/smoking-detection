@@ -69,6 +69,12 @@ class TrackState:
     unverified: bool = False     # 背向且網路分數高 → 無法確認警示
     phone: bool = False          # 手舉超過 max_dwell 未放下 → 講電話姿態
     last_hardcase_t: float = float("-inf")  # hard case 存檔冷卻
+    # 「接近未達標」診斷:手靠近臉但沒過 S2 門檻的一段動作
+    approach_active: bool = False
+    approach_start_t: float = 0.0
+    approach_last_t: float = 0.0
+    approach_min_d: float = float("inf")
+    approach_saw_s2: bool = False
     last_kpts: Optional[np.ndarray] = None
     last_dnorm: Optional[float] = None
     ori_hist: deque = field(default_factory=deque)  # (t, orientation)
@@ -136,6 +142,8 @@ class SmokingDetectionPipeline:
         self.count_driven = bool(al.get("count_driven", True))
         # 事件結算通知(GUI 掛載後可顯示「停留幾秒/是否計入/原因」)
         self.on_event = None
+        # 自由格式診斷訊息(接近未達標等)
+        self.on_log = None
         self._dwell_override = None  # GUI 即時調整停留窗口用
 
         # 移動排除(可開關):走動中(累積移動 ≥ N 倍身高)不視為抽菸
@@ -268,6 +276,7 @@ class SmokingDetectionPipeline:
                 if episode is not None and self.on_event is not None:
                     dwell, counted, reason = episode
                     self.on_event(tid, dwell, counted, reason)
+                self._track_approach(tid, st, stage, d, timestamp)
                 # 逗留偵測:手腕可見度 + 位移
                 if st.loiter is not None:
                     k = st.last_kpts
@@ -368,6 +377,31 @@ class SmokingDetectionPipeline:
 
         self._recycle_stale(timestamp)
         return results
+
+    def _track_approach(self, tid: int, st: TrackState, stage: int,
+                        d: Optional[float], timestamp: float) -> None:
+        """「接近未達標」診斷:手靠近臉(d < 門檻+0.5)但整段都沒觸發 S2
+        → 結束時記錄最近距離與門檻差距,回答「為什麼沒開始計時」。"""
+        near = self.skel_cfg.get("near_ratio", 0.9)
+        if d is not None and d < near + 0.5:
+            if not st.approach_active:
+                st.approach_active = True
+                st.approach_start_t = timestamp
+                st.approach_min_d = float("inf")
+                st.approach_saw_s2 = False
+            st.approach_last_t = timestamp
+            st.approach_min_d = min(st.approach_min_d, d)
+            st.approach_saw_s2 |= (stage == 1)
+        elif st.approach_active and \
+                timestamp - st.approach_last_t > 0.8:
+            duration = st.approach_last_t - st.approach_start_t
+            if (not st.approach_saw_s2 and duration >= 0.5
+                    and self.on_log is not None):
+                self.on_log(
+                    f"track {tid} 手接近臉 {duration:.1f} 秒,"
+                    f"最近距離 {st.approach_min_d:.2f} 未達門檻 {near:.2f}"
+                    f" → 未開始計時")
+            st.approach_active = False
 
     def set_dwell_window(self, min_dwell: float, max_dwell: float) -> None:
         """即時調整停留窗口(套用到現有與之後建立的所有 track)。"""
