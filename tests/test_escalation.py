@@ -80,10 +80,64 @@ class TestHandToMouthCounter:
         assert c.count() == 0
 
     def test_reset(self):
-        c = HandToMouthCounter()
+        c = HandToMouthCounter(min_dwell=0.5)
         feed_s2_episode(c, 0.0)
         c.reset()
         assert c.count() == 0
+
+
+class TestDwellWindow:
+    """停留時長三分類:<2s 戴耳機/扶眼鏡、2~5s 抽菸一口、>5s 講電話。"""
+
+    def _counter(self):
+        return HandToMouthCounter(min_dwell=2.0, max_dwell=5.0,
+                                  min_gap=2.0, gap_tolerance=0.5)
+
+    def test_short_touch_not_counted(self):
+        """舉一下就放下(1 秒)→ 戴耳機/扶眼鏡,不計。"""
+        c = self._counter()
+        feed_s2_episode(c, 0.0, dwell=1.0)
+        assert c.count() == 0
+
+    def test_smoking_puff_counted(self):
+        """停留 3 秒(2~5 秒窗內)→ 抽菸的一口,計一次。"""
+        c = self._counter()
+        feed_s2_episode(c, 0.0, dwell=3.0)
+        assert c.count() == 1
+
+    def test_boundary_dwells(self):
+        """恰為 2 秒與 5 秒(含邊界)都計。"""
+        c = self._counter()
+        t = feed_s2_episode(c, 0.0, dwell=2.05)
+        feed_s2_episode(c, t + 5.0, dwell=4.95)
+        assert c.count() == 2
+
+    def test_long_hold_is_phone_not_counted(self):
+        """一直舉著 8 秒 → 講電話,放下後也不計事件。"""
+        c = self._counter()
+        feed_s2_episode(c, 0.0, dwell=8.0)
+        assert c.count() == 0
+
+    def test_ongoing_dwell_flags_phone_in_realtime(self):
+        """超過 max_dwell 時,不必等放下即可由 ongoing_dwell 判講電話。"""
+        c = self._counter()
+        t = 0.0
+        while t < 6.0:                      # 手持續舉著 6 秒
+            c.update(S2, t)
+            t += 0.1
+        assert c.ongoing_dwell(t) > c.max_dwell   # 即時判定講電話
+        assert c.count() == 0                     # 尚未計入任何事件
+        # 放下後結算:8 秒 > max_dwell → 仍不計
+        c.update(BG, t)
+        c.update(BG, t + 1.0)
+        assert c.count() == 0
+        assert c.ongoing_dwell(t + 1.0) == 0.0
+
+    def test_no_max_dwell_when_none(self):
+        """max_dwell=None 時長停留照計(向下相容)。"""
+        c = HandToMouthCounter(min_dwell=2.0, max_dwell=None)
+        feed_s2_episode(c, 0.0, dwell=10.0)
+        assert c.count() == 1
 
 
 class TestLoiterDetector:

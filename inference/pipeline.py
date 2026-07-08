@@ -67,6 +67,7 @@ class TrackState:
     alarm_active: bool = False
     loitering: bool = False
     unverified: bool = False     # 背向且網路分數高 → 無法確認警示
+    phone: bool = False          # 手舉超過 max_dwell 未放下 → 講電話姿態
     last_hardcase_t: float = float("-inf")  # hard case 存檔冷卻
     last_kpts: Optional[np.ndarray] = None
     last_dnorm: Optional[float] = None
@@ -186,7 +187,8 @@ class SmokingDetectionPipeline:
                     window_sec=self.mg_cfg.get("window_sec", 10.0)),
                 counter=HandToMouthCounter(
                     window_sec=esc.get("window_sec", 90.0),
-                    min_dwell=esc.get("min_dwell", 0.5),
+                    min_dwell=esc.get("min_dwell", 2.0),
+                    max_dwell=esc.get("max_dwell", 5.0),
                     min_gap=esc.get("min_gap", 2.0),
                     gap_tolerance=esc.get("gap_tolerance", 0.5),
                     levels=((1, lv["low"]), (2, lv["mid"]), (3, lv["high"]))),
@@ -308,10 +310,15 @@ class SmokingDetectionPipeline:
             is_back = (st.back_fraction(timestamp,
                                         unv.get("window_sec", 5.0))
                        >= unv.get("back_frac", 0.6))
+            # 講電話姿態:手舉著超過 max_dwell 仍未放下(即時判定)
+            st.phone = (st.counter.max_dwell is not None
+                        and st.counter.ongoing_dwell(timestamp)
+                        > st.counter.max_dwell)
             # 紅色警報條件:非背向、非移動中(若開啟排除)、
-            # 事件次數達門檻、P 持續超過觸發線
+            # 非講電話姿態、事件次數達門檻、P 持續超過觸發線
             allow = (not is_back
                      and not (self.move_gate_enabled and st.moving)
+                     and not st.phone
                      and st.counter.count() >= self.min_events)
             st.last_P, st.alarm_active = self.alarm.update(
                 tid, cyc, timestamp, frame, allow_trigger=allow)
@@ -339,6 +346,7 @@ class SmokingDetectionPipeline:
                 "orientation": ori,
                 "unverified": st.unverified,
                 "moving": self.move_gate_enabled and st.moving,
+                "phone": st.phone,
             }
 
         self._recycle_stale(timestamp)
@@ -485,6 +493,8 @@ def draw_overlay(frame: np.ndarray, results: Dict[int, dict]) -> np.ndarray:
             label += " LOITER"
         if r.get("moving"):
             label += " MOVING"
+        if r.get("phone"):
+            label += " PHONE"
         if r["alarm"]:
             label += " SMOKING!"
         cv2.putText(vis, label, (x1, max(0, y1 - 8)),

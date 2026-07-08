@@ -401,6 +401,8 @@ class DemoGUI:
                 text += " 逗留"
             if r.get("moving"):
                 text += " 移動中"
+            if r.get("phone"):
+                text += " 講電話"
             if r["alarm"]:
                 text += " ⚠"
             lbl.config(text=text)

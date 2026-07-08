@@ -22,7 +22,8 @@ stream:                   # RTSP / 攝影機串流(inference/stream.py)
 
 escalation:               # 次數警戒等級:以手到嘴事件「次數」逐級升高
   window_sec: 90          # 滾動視窗
-  min_dwell: 0.5          # S2 停留 ≥ 此秒數才算一次事件
+  min_dwell: 2.0          # 停留 < 此秒數 → 戴耳機/扶眼鏡/摸臉,不計
+  max_dwell: 5.0          # 停留 > 此秒數(一直舉著)→ 講電話,不計
   min_gap: 2.0            # 事件間最小間隔(避免同一口重複計數)
   levels: {low: 0.2, mid: 0.5, high: 0.8}   # 1 次 / 2 次 / ≥3 次
 

@@ -96,19 +96,24 @@ def cycle_score(sm_score: float, net_score: float,
 class HandToMouthCounter:
     """手到嘴事件計數器:以「次數」決定警戒等級,而非單次動作觸發。
 
-    一次事件 = 一段 S2 停留(dwell ≥ min_dwell),且與上次事件間隔
-    ≥ min_gap(避免同一口菸被重複計數)。滾動視窗內:
-        1 次 → 低(0.2)、2 次 → 中(0.5)、≥3 次 → 高(0.8)
-    對應抽菸的週期性本質:單次手到嘴(喝一口水)只到低警戒,
-    重複多次才逐級升高。
+    以停留時長區分動作語意(抽菸吸一口的手到嘴有明確的時間窗):
+        dwell < min_dwell        → 戴耳機/扶眼鏡/摸臉,不計
+        min_dwell ≤ dwell ≤ max_dwell → 抽菸的一口,計一次事件
+        dwell > max_dwell(一直舉著)  → 講電話,不計
+        (進行中即可由 ongoing_dwell() 判斷講電話狀態,不必等放下)
+
+    事件與上次事件間隔 ≥ min_gap 才計(避免同一口重複計數)。
+    滾動視窗內:1 次 → 低(0.2)、2 次 → 中(0.5)、≥3 次 → 高(0.8)。
     """
 
-    def __init__(self, window_sec: float = 90.0, min_dwell: float = 0.5,
+    def __init__(self, window_sec: float = 90.0, min_dwell: float = 2.0,
+                 max_dwell: Optional[float] = 5.0,
                  min_gap: float = 2.0, gap_tolerance: float = 0.5,
                  levels: Tuple[Tuple[int, float], ...] = ((1, 0.2), (2, 0.5),
                                                           (3, 0.8))):
         self.window_sec = window_sec
         self.min_dwell = min_dwell
+        self.max_dwell = max_dwell            # None = 不設上限
         self.min_gap = min_gap
         # 骨架偵測會斷斷續續,S2 中斷 ≤ gap_tolerance 秒視為同一次停留
         self.gap_tolerance = gap_tolerance
@@ -127,8 +132,11 @@ class HandToMouthCounter:
         elif self._s2_start is not None and \
                 timestamp - self._s2_last > self.gap_tolerance:
             dwell = self._s2_last - self._s2_start
-            if (dwell >= self.min_dwell
-                    and self._s2_last - self._last_event >= self.min_gap):
+            in_window = (dwell >= self.min_dwell
+                         and (self.max_dwell is None
+                              or dwell <= self.max_dwell))
+            if in_window and \
+                    self._s2_last - self._last_event >= self.min_gap:
                 self._events.append(self._s2_last)
                 self._last_event = self._s2_last
             self._s2_start = None
@@ -137,6 +145,17 @@ class HandToMouthCounter:
         while self._events and \
                 timestamp - self._events[0] > self.window_sec:
             self._events.popleft()
+
+    def ongoing_dwell(self, timestamp: float) -> float:
+        """目前進行中的 S2 停留已持續秒數(無進行中停留回傳 0)。
+
+        超過 max_dwell 即可即時判定「講電話」姿態,不必等手放下。
+        """
+        if self._s2_start is None or self._s2_last is None:
+            return 0.0
+        if timestamp - self._s2_last > self.gap_tolerance:
+            return 0.0  # 已中斷,待下次 update 結算
+        return timestamp - self._s2_start
 
     def count(self) -> int:
         """目前視窗內的事件次數。"""
