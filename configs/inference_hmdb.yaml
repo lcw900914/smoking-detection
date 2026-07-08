@@ -76,6 +76,9 @@ alarm:
   release_threshold: 0.3
   sustain_sec: 2.0        # 短片段(HMDB 多為 4-9 秒)需較短持續時間
   min_events: 2           # 手到嘴事件 ≥ 此次數才通報(GUI 可調)
+  count_driven: true      # 次數主導:次數達標+無排除條件 → 直接推向觸發
+                          # (否則 0.4×次數分上限 0.32 過不了觸發線,
+                          #  警報實質被網路分數決定,次數形同虛設)
   snapshot_dir: ./alarms  # 觸發時截圖存檔位置
 
 track_recycle_sec: 3.0    # track 消失超過此秒數即回收 buffer 與狀態

@@ -130,6 +130,13 @@ class SmokingDetectionPipeline:
         al = infer_cfg["alarm"]
         # 通報次數門檻:手到嘴事件 ≥ 此次數才允許紅色警報(GUI 可調)
         self.min_events = int(al.get("min_events", 3))
+        # 次數主導模式:次數達標且無任何排除條件 → 直接把分數推向觸發區
+        # (否則 0.4×次數分上限 0.32 永遠過不了 0.6 觸發線,
+        #  次數形同虛設,警報實際被網路分數綁架)
+        self.count_driven = bool(al.get("count_driven", True))
+        # 事件結算通知(GUI 掛載後可顯示「停留幾秒/是否計入/原因」)
+        self.on_event = None
+        self._dwell_override = None  # GUI 即時調整停留窗口用
 
         # 移動排除(可開關):走動中(累積移動 ≥ N 倍身高)不視為抽菸
         mg = infer_cfg.get("move_gate", {})
@@ -187,8 +194,10 @@ class SmokingDetectionPipeline:
                     window_sec=self.mg_cfg.get("window_sec", 10.0)),
                 counter=HandToMouthCounter(
                     window_sec=esc.get("window_sec", 90.0),
-                    min_dwell=esc.get("min_dwell", 2.0),
-                    max_dwell=esc.get("max_dwell", 5.0),
+                    min_dwell=(self._dwell_override[0] if self._dwell_override
+                               else esc.get("min_dwell", 2.0)),
+                    max_dwell=(self._dwell_override[1] if self._dwell_override
+                               else esc.get("max_dwell", 5.0)),
                     min_gap=esc.get("min_gap", 2.0),
                     gap_tolerance=esc.get("gap_tolerance", 0.5),
                     levels=((1, lv["low"]), (2, lv["mid"]), (3, lv["high"]))),
@@ -254,7 +263,11 @@ class SmokingDetectionPipeline:
                 # 移動排除開啟且移動中:不計手到嘴事件(走動時手部
                 # 擺動易誤判;餵背景讓進行中的停留正常結算)
                 excluded = self.move_gate_enabled and st.moving
-                st.counter.update(3 if excluded else stage, timestamp)
+                episode = st.counter.update(3 if excluded else stage,
+                                            timestamp)
+                if episode is not None and self.on_event is not None:
+                    dwell, counted, reason = episode
+                    self.on_event(tid, dwell, counted, reason)
                 # 逗留偵測:手腕可見度 + 位移
                 if st.loiter is not None:
                     k = st.last_kpts
@@ -320,6 +333,10 @@ class SmokingDetectionPipeline:
                      and not (self.move_gate_enabled and st.moving)
                      and not st.phone
                      and st.counter.count() >= self.min_events)
+            # 次數主導:條件全過時分數直接推滿,P 快速進入觸發區,
+            # 經 sustain 秒確認後通報(事件過期後 P 自然衰退解除)
+            if self.count_driven and allow:
+                cyc = 1.0
             st.last_P, st.alarm_active = self.alarm.update(
                 tid, cyc, timestamp, frame, allow_trigger=allow)
 
@@ -351,6 +368,13 @@ class SmokingDetectionPipeline:
 
         self._recycle_stale(timestamp)
         return results
+
+    def set_dwell_window(self, min_dwell: float, max_dwell: float) -> None:
+        """即時調整停留窗口(套用到現有與之後建立的所有 track)。"""
+        self._dwell_override = (float(min_dwell), float(max_dwell))
+        for st in self._tracks.values():
+            st.counter.min_dwell = float(min_dwell)
+            st.counter.max_dwell = float(max_dwell)
 
     def _save_hard_case(self, tid: int, net_score: float,
                         timestamp: float, frame: np.ndarray) -> None:

@@ -123,8 +123,15 @@ class HandToMouthCounter:
         self._s2_last = None                  # 最後一次看到 S2 的時間
         self._last_event = float("-inf")
 
-    def update(self, stage_id: int, timestamp: float) -> None:
-        """推入一次階段判定;S2 中斷超過容忍值時結算是否構成事件。"""
+    def update(self, stage_id: int,
+               timestamp: float) -> Optional[Tuple[float, bool, str]]:
+        """推入一次階段判定;S2 中斷超過容忍值時結算是否構成事件。
+
+        Returns:
+            一段停留結算時回傳 (dwell 秒數, 是否計入, 原因),
+            供呼叫端顯示「為什麼沒計數」;其餘時刻回傳 None。
+        """
+        result = None
         if stage_id == S2:
             if self._s2_start is None:
                 self._s2_start = timestamp
@@ -132,19 +139,23 @@ class HandToMouthCounter:
         elif self._s2_start is not None and \
                 timestamp - self._s2_last > self.gap_tolerance:
             dwell = self._s2_last - self._s2_start
-            in_window = (dwell >= self.min_dwell
-                         and (self.max_dwell is None
-                              or dwell <= self.max_dwell))
-            if in_window and \
-                    self._s2_last - self._last_event >= self.min_gap:
+            if dwell < self.min_dwell:
+                result = (dwell, False, "太短(扶眼鏡/摸臉)")
+            elif self.max_dwell is not None and dwell > self.max_dwell:
+                result = (dwell, False, "太長(講電話)")
+            elif self._s2_last - self._last_event < self.min_gap:
+                result = (dwell, False, "與上次事件間隔不足")
+            else:
                 self._events.append(self._s2_last)
                 self._last_event = self._s2_last
+                result = (dwell, True, f"計入第 {len(self._events)} 次")
             self._s2_start = None
             self._s2_last = None
         # 移出視窗外的舊事件
         while self._events and \
                 timestamp - self._events[0] > self.window_sec:
             self._events.popleft()
+        return result
 
     def ongoing_dwell(self, timestamp: float) -> float:
         """目前進行中的 S2 停留已持續秒數(無進行中停留回傳 0)。

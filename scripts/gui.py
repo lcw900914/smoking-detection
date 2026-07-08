@@ -48,13 +48,17 @@ class DemoGUI:
             self._init_trigger = float(alarm_cfg["trigger_threshold"])
             self._init_release = float(alarm_cfg["release_threshold"])
             self._init_min_events = int(alarm_cfg.get("min_events", 3))
+            cfg_all = load_config(infer_config)
             self._init_move_gate = bool(
-                load_config(infer_config).get("move_gate", {})
-                .get("enabled", True))
+                cfg_all.get("move_gate", {}).get("enabled", True))
+            esc = cfg_all.get("escalation", {})
+            self._init_dwell_min = float(esc.get("min_dwell", 2.0))
+            self._init_dwell_max = float(esc.get("max_dwell", 5.0))
         except Exception:
             self._init_trigger, self._init_release = 0.75, 0.4
             self._init_min_events = 3
             self._init_move_gate = True
+            self._init_dwell_min, self._init_dwell_max = 2.0, 5.0
         root.title("抽菸行為偵測 Demo — channel-as-temporal-buffer")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -150,6 +154,24 @@ class DemoGUI:
         self.min_events_var.trace_add(
             "write", lambda *_: self._apply_thresholds())
 
+        # 停留窗口:min~max 秒的手到嘴停留才算抽菸一口(現場可校準)
+        row = ttk.Frame(thr)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="停留", width=6).pack(side="left")
+        self.dwell_min_var = tk.DoubleVar(value=self._init_dwell_min)
+        self.dwell_max_var = tk.DoubleVar(value=self._init_dwell_max)
+        ttk.Spinbox(row, from_=0.5, to=10.0, increment=0.5, width=4,
+                    textvariable=self.dwell_min_var,
+                    command=self._apply_thresholds).pack(side="left")
+        ttk.Label(row, text=" ~ ").pack(side="left")
+        ttk.Spinbox(row, from_=1.0, to=20.0, increment=0.5, width=4,
+                    textvariable=self.dwell_max_var,
+                    command=self._apply_thresholds).pack(side="left")
+        ttk.Label(row, text=" 秒才算一口(短=扶眼鏡 長=講電話)").pack(
+            side="left")
+        for v in (self.dwell_min_var, self.dwell_max_var):
+            v.trace_add("write", lambda *_: self._apply_thresholds())
+
         # 移動排除開關:走動中(累積移動 ≥ 3 倍身高)不視為抽菸
         self.move_gate_var = tk.BooleanVar(value=self._init_move_gate)
         ttk.Checkbutton(thr, text="移動排除(走動中不通報)",
@@ -232,6 +254,13 @@ class DemoGUI:
             except (tk.TclError, ValueError):
                 pass
             self.pipeline.move_gate_enabled = bool(self.move_gate_var.get())
+            try:
+                dmin = float(self.dwell_min_var.get())
+                dmax = float(self.dwell_max_var.get())
+                if 0 < dmin < dmax:
+                    self.pipeline.set_dwell_window(dmin, dmax)
+            except (tk.TclError, ValueError):
+                pass
 
     def start(self):
         if self.running:
@@ -262,6 +291,12 @@ class DemoGUI:
                     time.strftime("%H:%M:%S") +
                     f"  track {tid} 觸發警報(P={P:.2f}),截圖已存 {snap_dir}")
             pipeline.alarm.callback = gui_callback
+            # 事件結算通知:每次手放下顯示停留秒數與是否計入(可觀察校準)
+            pipeline.on_event = lambda tid, dwell, counted, reason: \
+                self.alarm_q.put(
+                    time.strftime("%H:%M:%S") +
+                    f"  track {tid} 停留 {dwell:.1f} 秒 → "
+                    f"{'✔ ' if counted else '✘ '}{reason}")
             self.pipeline = pipeline
             # 套用目前滑桿值(使用者的調整優先,不被設定檔覆蓋)
             self._apply_thresholds()

@@ -72,6 +72,7 @@ alarm:
   release_threshold: 0.4
   sustain_sec: 3.0        # 超過觸發門檻需持續秒數
   min_events: 3           # 手到嘴事件 ≥ 此次數才通報(GUI 可調)
+  count_driven: true      # 次數主導:次數達標+無排除條件 → 直接推向觸發
   snapshot_dir: ./alarms  # 觸發時截圖存檔位置
 
 track_recycle_sec: 3.0    # track 消失超過此秒數即回收 buffer 與狀態
