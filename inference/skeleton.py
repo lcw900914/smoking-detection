@@ -92,7 +92,8 @@ class SkeletonStageEstimator:
         # 腕點連續不可見(手出畫面/垂下)≥ 此幀數亦視為離臉 → 武裝;
         # 幻覺腕點恆定「可見」,不會走這條路
         self._none_arm_frames = max(2, int(0.5 * fps))
-        self._none_count = 0
+        self._none_count = 0   # 連續「正面但量不到腕點」幀數(武裝用)
+        self._gap_count = 0    # 連續無有效距離量測幀數(任何棄權路徑)
         self.lookback = max(2, int(0.6 * fps))
         self._hist: deque = deque(maxlen=int(3 * fps))  # d_norm 歷史
 
@@ -137,32 +138,32 @@ class SkeletonStageEstimator:
         kpts 為 None 或判定背向時棄權:回報背景、不產生 S2。
         """
         if kpts is None:
-            self._hist.append(np.nan)
+            # 無姿態(track 偵測閃爍):可武裝——真動作中斷後重現
+            # 手在嘴仍該續判;幻覺案例的姿態是恆定存在的
+            self._abstain(arm=True)
             return 3, None, "unknown"
 
         ori = estimate_orientation(kpts, self.kpt_conf, self.nose_conf)
         if ori == "back":
-            # 背向棄權:2D 腕-鼻距離不可信,不推 S2(也不倒扣)
-            self._hist.append(np.nan)
+            # 背向棄權:2D 腕-鼻距離不可信,不推 S2(也不倒扣);
+            # 不武裝——背向時手的真實位置未知
+            self._abstain(arm=False)
             return 3, None, ori
 
         # 太遠棄權:身體尺度不足,關鍵點量化誤差會淹沒真實距離
         scale = self._body_scale(kpts)
         if scale is not None and scale < self.min_scale_px:
-            self._hist.append(np.nan)
+            self._abstain(arm=False)
             return 3, None, ori
 
         d = self._wrist_nose_dist(kpts)
         if d is None:
             # 正面但量不到腕-鼻距離(手出畫面/垂下未偵測):
             # 持續一段時間即可武裝——手顯然不在臉部
-            self._none_count += 1
-            if self._none_count >= self._none_arm_frames:
-                self._armed = True
-                self._in_s2 = False
-            self._hist.append(np.nan)
+            self._abstain(arm=True)
             return 3, None, ori
         self._none_count = 0
+        self._gap_count = 0
         self._hist.append(d)
 
         # 距離自適應門檻:加上關鍵點像素誤差的相對餘裕
@@ -192,11 +193,31 @@ class SkeletonStageEstimator:
                     return 2, d, ori   # 自嘴部附近明顯拉大 → S3 放下
         return 3, d, ori
 
+    def _abstain(self, arm: bool) -> None:
+        """棄權路徑的共同狀態維護。
+
+        - 任何棄權持續超過容忍幀數 → 清 _in_s2(進行中的 S2 視為中斷,
+          之後須重新武裝;否則殘留的 _in_s2 會讓幻覺腕點繞過武裝機制)
+        - arm=True 的路徑(正面但量不到手)累積夠久 → 武裝
+        """
+        self._hist.append(np.nan)
+        self._gap_count += 1
+        if self._gap_count >= self._none_arm_frames:
+            self._in_s2 = False
+        if arm:
+            self._none_count += 1
+            if self._none_count >= self._none_arm_frames:
+                self._armed = True
+                self._in_s2 = False
+        else:
+            self._none_count = 0
+
     def reset(self) -> None:
         self._hist.clear()
         self._armed = False
         self._in_s2 = False
         self._none_count = 0
+        self._gap_count = 0
 
 
 def draw_skeleton(frame: np.ndarray, kpts: np.ndarray,

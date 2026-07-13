@@ -160,4 +160,9 @@ class VideoSource:
             with self._lock:
                 self._lock.notify_all()
             self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                # reader 卡在 cap.read()(網路掛死):此時 release cap
+                # 會與 reader 併用同一資源而崩潰;留給 daemon 執行緒
+                # 隨程序結束回收
+                return
         self.cap.release()

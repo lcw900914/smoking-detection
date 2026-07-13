@@ -229,6 +229,34 @@ class TestRiseArming:
             est.update(k_no_wrist)
         assert est.update(make_kpts(50))[0] == S2   # 已武裝 → 可信 S2
 
+    def test_stale_in_s2_cleared_after_back_interruption(self):
+        """S2 中被長時間背向中斷 → _in_s2 須清除,
+        之後的幻覺腕點(未經舉手)不得憑殘留狀態直接判 S2。"""
+        est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)
+        est.update(make_kpts(200))                       # 武裝
+        assert est.update(make_kpts(50))[0] == S2        # 真 S2 進行中
+        for _ in range(30):                              # 背向 3 秒
+            est.update(make_kpts(74, facing="back"))
+        # 轉回正面,腕點幻覺在衣領(d=0.74,未經舉手)→ 不採信
+        stage, _, _ = est.update(make_kpts(74))
+        assert stage != S2
+
+    def test_brief_back_does_not_break_ongoing_s2(self):
+        """短暫背向(1-2 幀,如偵測抖動)不中斷進行中的 S2。"""
+        est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)
+        est.update(make_kpts(200))
+        assert est.update(make_kpts(50))[0] == S2
+        est.update(make_kpts(74, facing="back"))         # 閃 2 幀
+        est.update(make_kpts(74, facing="back"))
+        assert est.update(make_kpts(50))[0] == S2        # 續判 S2
+
+    def test_no_pose_sustained_arms(self):
+        """整個姿態偵測不到(track 閃爍)持續 ≥0.5 秒 → 武裝。"""
+        est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)
+        for _ in range(6):
+            est.update(None)
+        assert est.update(make_kpts(50))[0] == S2        # 已武裝
+
     def test_brief_invisible_wrist_does_not_arm(self):
         """腕點只消失 1-2 幀(偵測閃爍)不武裝,幻覺懸停仍擋得住。"""
         est = SkeletonStageEstimator(near_ratio=0.9, rise_margin=0.5, fps=10)

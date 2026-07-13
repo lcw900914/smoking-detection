@@ -193,9 +193,14 @@ class DemoGUI:
             anchor="w", pady=2)
 
         # 診斷訊息開關(預設關):校準時才顯示未計入/未達門檻的原因
+        # 注意:工作執行緒不可直接讀 tk 變數(tkinter 非執行緒安全),
+        # 由 _apply_thresholds 在主執行緒快取成 _diag_enabled
         self.diag_var = tk.BooleanVar(value=False)
+        self._diag_enabled = False
         ttk.Checkbutton(thr, text="顯示診斷訊息(校準用)",
-                        variable=self.diag_var).pack(anchor="w", pady=2)
+                        variable=self.diag_var,
+                        command=self._apply_thresholds).pack(
+            anchor="w", pady=2)
 
         # 下:控制列
         ctrl = ttk.Frame(main, padding=(0, 6))
@@ -282,10 +287,18 @@ class DemoGUI:
             self.ckpt_var.set(p)
 
     def _apply_thresholds(self, _=None):
+        # 主執行緒快取診斷開關,供影像執行緒安全讀取
+        try:
+            self._diag_enabled = bool(self.diag_var.get())
+        except tk.TclError:
+            pass
         if self.pipeline is not None:
             self.pipeline.alarm.trigger = self.trigger_var.get()
-            self.pipeline.alarm.release = min(self.release_var.get(),
-                                              self.trigger_var.get() - 0.01)
+            # 解除線夾在 [0.01, 觸發線-0.01]:觸發線拉到 0 時
+            # 解除線若為負,P≥0 永遠無法解除警報
+            self.pipeline.alarm.release = max(
+                0.01, min(self.release_var.get(),
+                          self.trigger_var.get() - 0.01))
             try:  # Spinbox 打字中可能是空字串
                 self.pipeline.min_events = max(1, int(self.min_events_var.get()))
             except (tk.TclError, ValueError):
@@ -338,8 +351,10 @@ class DemoGUI:
             # 事件結算通知:每次手放下顯示停留秒數與是否計入(可觀察校準)
             # 記錄原則:預設只顯示「警報觸發」;
             # 事件計次與未達門檻等過程訊息全部歸入診斷開關
+            # 影像執行緒內執行:只讀主執行緒快取的 _diag_enabled,
+            # 不可直接碰 tk 變數
             def log_event(tid, dwell, counted, reason):
-                if self.diag_var.get():
+                if self._diag_enabled:
                     mark = "✔" if counted else "✘"
                     self.alarm_q.put(
                         time.strftime("%H:%M:%S") +
@@ -347,7 +362,7 @@ class DemoGUI:
             pipeline.on_event = log_event
             pipeline.on_log = lambda msg: (
                 self.alarm_q.put(time.strftime("%H:%M:%S") + "  " + msg)
-                if self.diag_var.get() else None)
+                if self._diag_enabled else None)
             self.pipeline = pipeline
             # 套用目前滑桿值(使用者的調整優先,不被設定檔覆蓋)
             self._apply_thresholds()
