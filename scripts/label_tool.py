@@ -41,6 +41,7 @@ CATEGORIES = [
     ("3", "phone",      "講電話",       False),
     ("4", "desk_work",  "桌面工作/摸臉", False),
     ("5", "other_neg",  "其他非抽菸",   False),
+    ("6", "bad_pose",   "骨架錯誤(排除)", False),  # 骨架畫錯人/錯位:不進訓練
     ("0", "unsure",     "不確定",       False),
 ]
 NAME_OF = {code: name for _, code, name, _ in CATEGORIES}
@@ -87,6 +88,18 @@ class LabelTool:
         if not self.clips:
             raise SystemExit(f"{clip_dir} 下沒有 mp4 片段")
         self.keys = [str(Path(p).as_posix()) for p in self.clips]
+
+        # 骨架關聯率(annotations/pose 回抽結果):輔助判斷骨架品質
+        self.pose_rate = {}
+        pose_dir = Path("annotations/pose")
+        if pose_dir.is_dir():
+            import numpy as np
+            for p in self.clips:
+                npz = pose_dir / (Path(p).stem + ".npz")
+                if npz.exists():
+                    d = np.load(npz, allow_pickle=True)
+                    self.pose_rate[str(Path(p).as_posix())] = \
+                        float(d["valid"].mean())
 
         self.idx = self._first_unlabeled()
         self.cap = None
@@ -167,20 +180,26 @@ class LabelTool:
         self._update_info()
 
     def _update_info(self):
-        cur = self.store.get(self.keys[self.idx])
+        key = self.keys[self.idx]
+        cur = self.store.get(key)
         mark = f"|| 目前標記:{NAME_OF.get(cur['label'], cur['label'])}" \
             if cur else "|| 未標記"
+        rate = self.pose_rate.get(key)
+        pose_txt = (f"骨架關聯 {rate:.0%}" if rate is not None
+                    else "無節點資料")
         self.info_var.set(
             f"第 {self.idx + 1} / {len(self.clips)} 段  "
             f"{os.path.basename(self.clips[self.idx])}  {mark}"
-            f"   (速度 {self.speed}x)")
+            f"   [{pose_txt}](速度 {self.speed}x)")
         done = self.store.count_labeled(self.keys)
         n_pos = sum(1 for k in self.keys
                     if (self.store.get(k) or {}).get("label") == "smoking")
+        n_bad = sum(1 for k in self.keys
+                    if (self.store.get(k) or {}).get("label") == "bad_pose")
         self.progress_var.set(
             f"進度:已標 {done} / {len(self.clips)}"
-            f"(抽菸 {n_pos},非抽菸 {done - n_pos})"
-            f"   標籤檔:{LABELS_PATH}")
+            f"(抽菸 {n_pos},非抽菸 {done - n_pos - n_bad},"
+            f"骨架錯誤排除 {n_bad})   標籤檔:{LABELS_PATH}")
 
     def goto(self, idx: int):
         self.idx = max(0, min(len(self.clips) - 1, idx))

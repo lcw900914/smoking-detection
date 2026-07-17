@@ -32,7 +32,7 @@ class PoseClipDataset(Dataset):
     def __init__(self, pose_dir: str = "annotations/pose",
                  labels_path: str = "annotations/clip_labels.json",
                  window: int = 128, train: bool = True,
-                 exclude: tuple = ("unsure",),
+                 exclude: tuple = ("unsure", "bad_pose"),
                  min_valid: float = 0.3,
                  items: Optional[List[dict]] = None):
         self.window = window
