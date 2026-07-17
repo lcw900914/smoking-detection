@@ -1,0 +1,353 @@
+{
+ "version": 1,
+ "labels": {
+  "alarms/clips/alarm_track1_20260708_152117.mp4": {
+   "label": "smoking",
+   "labeled_at": "2026-07-17 13:26:01"
+  },
+  "alarms/clips/alarm_track4_20260708_152503.mp4": {
+   "label": "smoking",
+   "labeled_at": "2026-07-17 13:26:05"
+  },
+  "alarms/clips/alarm_track3_20260708_152821.mp4": {
+   "label": "smoking",
+   "labeled_at": "2026-07-17 13:26:11"
+  },
+  "alarms/clips/alarm_track2_20260708_153431.mp4": {
+   "label": "smoking",
+   "labeled_at": "2026-07-17 13:26:17"
+  },
+  "alarms/clips/alarm_track42_20260708_154524.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:26:24"
+  },
+  "alarms/clips/alarm_track61_20260708_191808.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:26:31"
+  },
+  "alarms/clips/alarm_track283_20260708_192653.mp4": {
+   "label": "smoking",
+   "labeled_at": "2026-07-17 13:26:33"
+  },
+  "alarms/clips/alarm_track1252_20260708_212915.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:26:39"
+  },
+  "alarms/clips/alarm_track1398_20260708_214913.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:26:52"
+  },
+  "alarms/clips/alarm_track1602_20260708_221111.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:27:05"
+  },
+  "alarms/clips/alarm_track1624_20260708_221939.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:27:14"
+  },
+  "alarms/clips/alarm_track2218_20260709_115404.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:27:24"
+  },
+  "alarms/clips/alarm_track3186_20260709_131353.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:27:31"
+  },
+  "alarms/clips/alarm_track3160_20260709_131409.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:27:36"
+  },
+  "alarms/clips/alarm_track3216_20260709_131608.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:27:55"
+  },
+  "alarms/clips/alarm_track3294_20260709_132005.mp4": {
+   "label": "smoking",
+   "labeled_at": "2026-07-17 13:27:57"
+  },
+  "alarms/clips/alarm_track3421_20260709_132552.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:06"
+  },
+  "alarms/clips/alarm_track4680_20260709_143520.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:12"
+  },
+  "alarms/clips/alarm_track4762_20260709_143828.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:12"
+  },
+  "alarms/clips/alarm_track4813_20260709_143942.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:13"
+  },
+  "alarms/clips/alarm_track4813_20260709_144049.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:15"
+  },
+  "alarms/clips/alarm_track4781_20260709_144107.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:16"
+  },
+  "alarms/clips/alarm_track4914_20260709_144839.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:19"
+  },
+  "alarms/clips/alarm_track5090_20260709_145741.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:21"
+  },
+  "alarms/clips/alarm_track5788_20260709_154101.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:23"
+  },
+  "alarms/clips/alarm_track5833_20260709_154321.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:23"
+  },
+  "alarms/clips/alarm_track5996_20260709_155817.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:24"
+  },
+  "alarms/clips/alarm_track6418_20260709_163741.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:24"
+  },
+  "alarms/clips/alarm_track6418_20260709_163818.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:24"
+  },
+  "alarms/clips/alarm_track6471_20260709_164110.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:24"
+  },
+  "alarms/clips/alarm_track6773_20260709_165619.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:24"
+  },
+  "alarms/clips/alarm_track7003_20260709_170904.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:34"
+  },
+  "alarms/clips/alarm_track7990_20260710_092453.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:25"
+  },
+  "alarms/clips/alarm_track7957_20260710_092502.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:25"
+  },
+  "alarms/clips/alarm_track8431_20260710_121034.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:25"
+  },
+  "alarms/clips/alarm_track8840_20260710_132142.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:26"
+  },
+  "alarms/clips/alarm_track8946_20260710_133917.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:26"
+  },
+  "alarms/clips/alarm_track9129_20260710_141700.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:26"
+  },
+  "alarms/clips/alarm_track9510_20260710_153338.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:28:40"
+  },
+  "alarms/clips/alarm_track10010_20260710_164013.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:28:49"
+  },
+  "alarms/clips/alarm_track12857_20260712_133000.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:28:51"
+  },
+  "alarms/clips/alarm_track12985_20260712_140248.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:28:53"
+  },
+  "alarms/clips/alarm_track13082_20260712_141749.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:28:56"
+  },
+  "alarms/clips/alarm_track13286_20260712_150554.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:29:06"
+  },
+  "alarms/clips/alarm_track13478_20260712_152257.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:29:08"
+  },
+  "alarms/clips/alarm_track13593_20260712_155231.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:29:09"
+  },
+  "alarms/clips/alarm_track13618_20260712_160827.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:29:17"
+  },
+  "alarms/clips/alarm_track13860_20260712_182535.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:29:24"
+  },
+  "alarms/clips/alarm_track13983_20260712_192453.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:29:45"
+  },
+  "alarms/clips/alarm_track13992_20260712_192814.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:29:49"
+  },
+  "alarms/clips/alarm_track15556_20260713_120854.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:29:52"
+  },
+  "alarms/clips/alarm_track15702_20260713_123142.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:30:00"
+  },
+  "alarms/clips/alarm_track15681_20260713_123240.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:30:08"
+  },
+  "alarms/clips/alarm_track15921_20260713_131055.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:30:16"
+  },
+  "alarms/clips/alarm_track15921_20260713_131126.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:30:17"
+  },
+  "alarms/clips/alarm_track16369_20260713_134947.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:30:25"
+  },
+  "alarms/clips/alarm_track16466_20260713_140648.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:30:27"
+  },
+  "alarms/clips/alarm_track17080_20260713_152554.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:30:28"
+  },
+  "alarms/clips/alarm_track18064_20260713_165313.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:30:37"
+  },
+  "alarms/clips/alarm_track18689_20260713_172930.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:30:50"
+  },
+  "alarms/clips/alarm_track20152_20260713_202713.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:30:55"
+  },
+  "alarms/clips/alarm_track20519_20260713_230757.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:30:58"
+  },
+  "alarms/clips/alarm_track22134_20260714_111621.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:05"
+  },
+  "alarms/clips/alarm_track22137_20260714_111648.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:06"
+  },
+  "alarms/clips/alarm_track22801_20260714_124942.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:07"
+  },
+  "alarms/clips/alarm_track23217_20260714_133308.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:08"
+  },
+  "alarms/clips/alarm_track24414_20260714_151744.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:10"
+  },
+  "alarms/clips/alarm_track25377_20260714_161845.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:18"
+  },
+  "alarms/clips/alarm_track26656_20260714_173420.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:19"
+  },
+  "alarms/clips/alarm_track26632_20260714_173434.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:20"
+  },
+  "alarms/clips/alarm_track27349_20260714_202746.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:31:22"
+  },
+  "alarms/clips/alarm_track27804_20260714_222954.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:27"
+  },
+  "alarms/clips/alarm_track30127_20260715_121522.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:29"
+  },
+  "alarms/clips/alarm_track30673_20260715_123930.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:31"
+  },
+  "alarms/clips/alarm_track30730_20260715_124405.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:39"
+  },
+  "alarms/clips/alarm_track31489_20260715_133613.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:31:44"
+  },
+  "alarms/clips/alarm_track32373_20260715_164657.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:50"
+  },
+  "alarms/clips/alarm_track32580_20260715_165515.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:31:59"
+  },
+  "alarms/clips/alarm_track32876_20260715_170539.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:32:01"
+  },
+  "alarms/clips/alarm_track32876_20260715_170647.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:32:13"
+  },
+  "alarms/clips/alarm_track33833_20260715_173849.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:32:15"
+  },
+  "alarms/clips/alarm_track33984_20260715_174122.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:32:22"
+  },
+  "alarms/clips/alarm_track34058_20260715_174538.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:32:24"
+  },
+  "alarms/clips/alarm_track35375_20260715_195837.mp4": {
+   "label": "desk_work",
+   "labeled_at": "2026-07-17 13:32:31"
+  },
+  "alarms/clips/alarm_track35781_20260715_201830.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:32:36"
+  },
+  "alarms/clips/alarm_track36673_20260715_212854.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:32:51"
+  },
+  "alarms/clips/alarm_track36728_20260715_213328.mp4": {
+   "label": "other_neg",
+   "labeled_at": "2026-07-17 13:32:57"
+  }
+ }
+}
