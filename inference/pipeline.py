@@ -33,7 +33,7 @@ from tracking.tracker import PersonTracker
 from tracking.roi import ROISmoother, crop_upper_body
 from inference.state_machine import (StageStateMachine, cycle_score,
                                      HandToMouthCounter, LoiterDetector,
-                                     MovementGate)
+                                     MovementGate, PresenceClassifier)
 from inference.skeleton import (SkeletonStageEstimator, draw_skeleton,
                                 L_WRI, R_WRI)
 from inference.alarm import AlarmManager
@@ -59,6 +59,8 @@ class TrackState:
     counter: HandToMouthCounter
     move_gate: Optional[MovementGate] = None
     moving: bool = False         # 視窗內移動 ≥ N 倍身高
+    presence: Optional[PresenceClassifier] = None
+    presence_state: str = "unknown"   # 經過 / 徘徊 / 等待
     skeleton: Optional[SkeletonStageEstimator] = None
     loiter: Optional[LoiterDetector] = None
     last_seen: float = 0.0
@@ -193,6 +195,7 @@ class SmokingDetectionPipeline:
                         wrist_vis_max=lo.get("wrist_vis_max", 0.1))
             esc = self.cfg.get("escalation", {})
             lv = esc.get("levels", {"low": 0.2, "mid": 0.5, "high": 0.8})
+            pr = self.cfg.get("presence", {})
             self._tracks[tid] = TrackState(
                 buffer=buffer,
                 state_machine=StageStateMachine(
@@ -201,6 +204,13 @@ class SmokingDetectionPipeline:
                 move_gate=MovementGate(
                     max_heights=self.mg_cfg.get("max_heights", 3.0),
                     window_sec=self.mg_cfg.get("window_sec", 10.0)),
+                presence=PresenceClassifier(
+                    window_sec=pr.get("window_sec", 60.0),
+                    short_stay=pr.get("short_stay", 8.0),
+                    long_stay=pr.get("long_stay", 20.0),
+                    pass_path=pr.get("pass_path", 1.0),
+                    wander_path=pr.get("wander_path", 3.0),
+                    run_speed=pr.get("run_speed", 1.5)),
                 counter=HandToMouthCounter(
                     window_sec=esc.get("window_sec", 90.0),
                     min_dwell=(self._dwell_override[0] if self._dwell_override
@@ -249,6 +259,10 @@ class SmokingDetectionPipeline:
             # 移動量恆常累計(排除與否由開關決定,開關切換即時反映)
             if st.move_gate is not None:
                 st.moving = st.move_gate.update(timestamp, smoothed)
+            # 在場型態(經過/徘徊/等待)恆常更新:純軌跡幾何,
+            # 與骨架分支是否啟用無關
+            if st.presence is not None:
+                st.presence_state = st.presence.update(timestamp, smoothed)
             boxes.append(smoothed)
             tids.append(tid)
             if self.use_model:
@@ -370,6 +384,7 @@ class SmokingDetectionPipeline:
                 "events": st.counter.count(),
                 "level": st.counter.score(),
                 "loiter": st.loitering,
+                "presence": st.presence_state,
                 "orientation": ori,
                 "unverified": st.unverified,
                 "moving": self.move_gate_enabled and st.moving,
@@ -523,6 +538,14 @@ def alert_level_name(level: float) -> str:
     return ""
 
 
+# 在場型態的畫面標籤(畫面用英文,GUI 面板與記錄用中文)
+_PRESENCE_TAGS = {"passing": "PASS", "running": "RUN",
+                  "wandering": "WANDER", "waiting": "WAIT"}
+PRESENCE_NAMES = {"passing": "經過", "running": "經過(跑)",
+                  "wandering": "徘徊", "waiting": "等待",
+                  "unknown": ""}
+
+
 def draw_overlay(frame: np.ndarray, results: Dict[int, dict]) -> np.ndarray:
     """畫面疊加:框、ID、階段、次數警戒等級、逗留標記、P_t 條、骨架。"""
     vis = frame.copy()
@@ -557,6 +580,9 @@ def draw_overlay(frame: np.ndarray, results: Dict[int, dict]) -> np.ndarray:
             label += " LOITER"
         if r.get("moving"):
             label += " MOVING"
+        tag = _PRESENCE_TAGS.get(r.get("presence"))
+        if tag:
+            label += f" {tag}"
         if r.get("phone"):
             label += " PHONE"
         if r["alarm"]:

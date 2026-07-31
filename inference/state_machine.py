@@ -229,6 +229,107 @@ class MovementGate:
         self._hist.clear()
 
 
+class PresenceClassifier:
+    """在場型態分類:經過 / 徘徊 / 等待。
+
+    純幾何,從框的軌跡直接算 —— 這幾件事本來就是確定的,交給模型學
+    只會把「一個可以隨時調的門檻」變成「要重訓才能改的權重」。
+
+    量測一律以人物自身身高(框高)為單位,與攝影機距離無關:
+        累積路徑  = 中心逐幀位移總和 ÷ 平均框高   (走了多少)
+        位移範圍  = 起訖最大距離 ÷ 平均框高       (走多遠,來回會抵銷)
+        速度      = 累積路徑 ÷ 經過秒數           (身高/秒)
+
+    判定:
+        在場短 + 有移動            → 經過(速度超過 run_speed 記為跑步)
+        在場久 + 累積路徑大        → 徘徊(一直在動,但沒離開)
+        在場久 + 累積路徑小        → 等待(待著不太動)
+        其餘(剛出現、還看不準)    → unknown
+
+    「累積路徑」與「位移範圍」分開看是關鍵:在原地來回踱步的人位移範圍
+    很小,但累積路徑很大 —— 這正是徘徊,只看位移會誤判成等待。
+
+    限制:影像空間的量測,朝鏡頭正面走來的人位移看起來很小,可能被判成
+    等待。要根治得靠地面標定,目前先以側向/俯視鏡位為前提。
+    """
+
+    PASSING = "passing"      # 經過(走)
+    RUNNING = "running"      # 經過(跑)
+    WANDERING = "wandering"  # 徘徊
+    WAITING = "waiting"      # 等待
+    UNKNOWN = "unknown"      # 在場時間還不夠判斷
+
+    def __init__(self, window_sec: float = 60.0, short_stay: float = 8.0,
+                 long_stay: float = 20.0, pass_path: float = 1.0,
+                 wander_path: float = 3.0, run_speed: float = 1.5):
+        """
+        Args:
+            window_sec: 軌跡回看視窗秒數(在場時長仍以首次出現起算)
+            short_stay: 在場短於此秒數且有移動 → 經過
+            long_stay: 在場超過此秒數才判徘徊/等待
+            pass_path: 判「經過」所需的最小累積路徑(倍數×身高)
+            wander_path: 累積路徑超過此值(倍數×身高)→ 徘徊,否則等待
+            run_speed: 平均速度超過此值(身高/秒)→ 記為跑步
+        """
+        self.window_sec = window_sec
+        self.short_stay = short_stay
+        self.long_stay = long_stay
+        self.pass_path = pass_path
+        self.wander_path = wander_path
+        self.run_speed = run_speed
+        self._first_ts: Optional[float] = None
+        self._hist: Deque[Tuple[float, float, float, float]] = deque()
+        # (t, cx, cy, 框高)
+
+    def update(self, timestamp: float, bbox) -> str:
+        """推入一幀框,回傳目前的在場型態。"""
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        if self._first_ts is None:
+            self._first_ts = timestamp
+        self._hist.append((timestamp, (x1 + x2) / 2, (y1 + y2) / 2,
+                           max(1.0, y2 - y1)))
+        while self._hist and timestamp - self._hist[0][0] > self.window_sec:
+            self._hist.popleft()
+
+        stay = timestamp - self._first_ts
+        path, _span, speed = self._metrics()
+
+        if stay >= self.long_stay:
+            return (self.WANDERING if path >= self.wander_path
+                    else self.WAITING)
+        if stay >= self.short_stay:
+            return self.UNKNOWN          # 中間地帶:還不夠判,先不表態
+        if path >= self.pass_path:
+            return self.RUNNING if speed >= self.run_speed else self.PASSING
+        return self.UNKNOWN
+
+    def _metrics(self):
+        """回傳 (累積路徑, 位移範圍, 速度),單位皆為身高倍數。"""
+        if len(self._hist) < 2:
+            return 0.0, 0.0, 0.0
+        pts = list(self._hist)
+        path = 0.0
+        for (_, x0, y0, _), (_, x1, y1, _) in zip(pts, pts[1:]):
+            path += ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+        mean_h = sum(h for _, _, _, h in pts) / len(pts)
+        xs = [p[1] for p in pts]
+        ys = [p[2] for p in pts]
+        span = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
+        dt = max(1e-6, pts[-1][0] - pts[0][0])
+        return path / mean_h, span / mean_h, (path / mean_h) / dt
+
+    def stats(self):
+        """診斷用:(在場秒數, 累積路徑, 位移範圍, 速度)。"""
+        path, span, speed = self._metrics()
+        stay = (0.0 if self._first_ts is None
+                else self._hist[-1][0] - self._first_ts) if self._hist else 0.0
+        return stay, path, span, speed
+
+    def reset(self) -> None:
+        self._hist.clear()
+        self._first_ts = None
+
+
 class LoiterDetector:
     """逗留偵測:長時間在場 + 手部關鍵點幾乎不可見 + 位移小 → 逗留警告。
 
