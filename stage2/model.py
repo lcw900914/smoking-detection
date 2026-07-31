@@ -7,9 +7,11 @@ import torch
 import torch.nn as nn
 
 from stage2.normalize import FEATURE_DIM
+from stage2.taxonomy import TRAIN_CLASSES
 
-# 與標記工具一致的類別順序(smoking 固定為 index 0)
-CLASSES = ["smoking", "drinking", "phone", "desk_work", "other_neg"]
+# 訓練用的合併類別(細標籤與合併規則見 stage2/taxonomy.py)。
+# smoking 固定為 index 0,評估時直接取這一維當抽菸機率。
+CLASSES = TRAIN_CLASSES
 
 
 class TCNBlock(nn.Module):

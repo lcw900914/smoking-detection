@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import Dataset
 
 from stage2.normalize import normalize_sequence
-from stage2.model import CLASSES
+from stage2.taxonomy import train_index
 
 # COCO 水平翻轉的左右關節對調索引
 FLIP_IDX = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
@@ -49,15 +49,19 @@ class PoseClipDataset(Dataset):
             data = np.load(npz_path, allow_pickle=True)
             clip_key = str(data["clip"])
             lab = labels.get(clip_key)
-            if lab is None or lab["label"] in exclude \
-                    or lab["label"] not in CLASSES:
+            if lab is None or lab["label"] in exclude:
+                continue
+            # 細標籤 → 合併後的訓練類別;排除類與無法對應的舊雜項
+            # (例如舊的 other_neg)回傳 None,不進訓練
+            y = train_index(lab["label"])
+            if y is None:
                 continue
             if data["valid"].mean() < min_valid:
                 n_low += 1      # 關聯率過低:節點序列不可信,棄用
                 continue
             self.items.append({
                 "kpts": data["kpts"], "valid": data["valid"],
-                "label": CLASSES.index(lab["label"]),
+                "label": y,
                 "clip": clip_key,
             })
         if n_low:

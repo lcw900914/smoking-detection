@@ -1,20 +1,20 @@
-"""警報片段標記工具:逐段播放,標記是否為抽菸(訓練資料用)。
+"""警報片段標記工具:逐段播放,標記「手在做什麼」(訓練資料用)。
 
 用法(專案根目錄):
     python scripts/label_tool.py                     # 標 alarms/clips
     python scripts/label_tool.py --dir <其他資料夾>
 
-操作(按鈕或快捷鍵):
-    1 = 抽菸          2 = 喝水/飲食      3 = 講電話
-    4 = 桌面工作/摸臉  5 = 其他非抽菸     0 = 不確定(之後再看)
-    ←/→ = 上一段/下一段    F = 播放速度 1x/2x    Q = 離開
+操作:
+    1-6 = 動作類別   8/9/0 = 排除(類別表見 stage2/taxonomy.py)
+    ←/→ = 上一段/下一段   F 或空白鍵 = 播放速度 1x/2x   Q 或 Esc = 離開
 
 行為:
 - 標記即寫入 annotations/clip_labels.json(逐筆存檔,中斷不掉資料)
 - 啟動時自動跳到第一段未標記的片段;已標記的片段會顯示目前標籤
 - 標記後自動跳下一段未標記
-- 標籤語意:label=smoking 為正樣本,其餘皆為負樣本
-  (細分類別供第二階段多分類訓練,攤開負類別比二元更有辨別力)
+- 只標手部動作。經過/徘徊/等待這類移動型態由框的軌跡自動算,不用標
+- 類別刻意不細分:手臂只有肩/肘/腕三個節點,推眼鏡與摸鼻子在特徵
+  空間裡分不開,分開標只會製造雜訊(理由詳見 stage2/taxonomy.py)
 """
 import argparse
 import glob
@@ -23,6 +23,7 @@ import os
 import sys
 import time
 import tkinter as tk
+from collections import Counter
 from pathlib import Path
 from tkinter import ttk
 
@@ -32,19 +33,11 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import cv2  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
 
-LABELS_PATH = Path("annotations/clip_labels.json")
+from stage2.taxonomy import (CATEGORIES, EXAMPLES, GROUPS,  # noqa: E402
+                             LEGACY_CODES, MERGE, TRAIN_CLASSES,
+                             display_name)
 
-# (鍵, 標籤代碼, 顯示名, 是否為正樣本)
-CATEGORIES = [
-    ("1", "smoking",    "抽菸",         True),
-    ("2", "drinking",   "喝水/飲食",    False),
-    ("3", "phone",      "講電話",       False),
-    ("4", "desk_work",  "桌面工作/摸臉", False),
-    ("5", "other_neg",  "其他非抽菸",   False),
-    ("6", "bad_pose",   "骨架錯誤(排除)", False),  # 骨架畫錯人/錯位:不進訓練
-    ("0", "unsure",     "不確定",       False),
-]
-NAME_OF = {code: name for _, code, name, _ in CATEGORIES}
+LABELS_PATH = Path("annotations/clip_labels.json")
 
 VIDEO_W, VIDEO_H = 960, 540
 
@@ -136,33 +129,56 @@ class LabelTool:
                   font=("Microsoft JhengHei", 11)).grid(
             row=1, column=0, sticky="w", pady=(6, 2))
 
+        # 類別按鈕:一組一列,列首標分組名(類別多,平鋪會擠成一團)
         btns = ttk.Frame(main)
         btns.grid(row=2, column=0, sticky="ew", pady=4)
-        for key, code, name, _pos in CATEGORIES:
-            ttk.Button(btns, text=f"[{key}] {name}",
-                       command=lambda c=code: self.label(c)).pack(
-                side="left", padx=3)
-        ttk.Button(btns, text="[←] 上一段",
+        for group in GROUPS:
+            row = ttk.Frame(btns)
+            row.pack(fill="x", pady=1)
+            ttk.Label(row, text=group, width=9,
+                      font=("Microsoft JhengHei", 9, "bold")).pack(
+                side="left")
+            for key, code, name, g in CATEGORIES:
+                if g == group:
+                    ttk.Button(row, text=f"[{key}] {name}", width=14,
+                               command=lambda c=code: self.label(c)).pack(
+                        side="left", padx=2)
+
+        # 概括型類別涵蓋什麼,直接寫在畫面上 —— 不讓標記者自己解讀,
+        # 否則同一個動作今天標 5、明天標 6,標籤就不一致了
+        hint = "   ".join(
+            f"[{k}] {n} = {EXAMPLES[c]}"
+            for k, c, n, _g in CATEGORIES if c in EXAMPLES)
+        ttk.Label(btns, text=hint, foreground="#666666",
+                  font=("Microsoft JhengHei", 9)).pack(
+            anchor="w", pady=(4, 0))
+
+        nav = ttk.Frame(btns)
+        nav.pack(fill="x", pady=(6, 0))
+        ttk.Label(nav, text="", width=7).pack(side="left")
+        ttk.Button(nav, text="[←] 上一段",
                    command=lambda: self.goto(self.idx - 1)).pack(
-            side="left", padx=(18, 3))
-        ttk.Button(btns, text="[→] 下一段",
+            side="left", padx=2)
+        ttk.Button(nav, text="[→] 下一段",
                    command=lambda: self.goto(self.idx + 1)).pack(
-            side="left", padx=3)
-        ttk.Button(btns, text="[F] 速度",
-                   command=self.toggle_speed).pack(side="left", padx=3)
+            side="left", padx=2)
+        ttk.Button(nav, text="[F] 速度",
+                   command=self.toggle_speed).pack(side="left", padx=2)
 
         self.progress_var = tk.StringVar()
         ttk.Label(main, textvariable=self.progress_var).grid(
             row=3, column=0, sticky="w")
 
     def _bind_keys(self):
-        for key, code, _n, _p in CATEGORIES:
+        # 類別全用數字鍵,字母鍵留給操作(q/f 維持原本的語意)
+        for key, code, _n, _g in CATEGORIES:
             self.root.bind(key, lambda _e, c=code: self.label(c))
         self.root.bind("<Left>", lambda _e: self.goto(self.idx - 1))
         self.root.bind("<Right>", lambda _e: self.goto(self.idx + 1))
-        self.root.bind("f", lambda _e: self.toggle_speed())
-        self.root.bind("F", lambda _e: self.toggle_speed())
-        self.root.bind("q", lambda _e: self.root.destroy())
+        for k in ("f", "F", "<space>"):
+            self.root.bind(k, lambda _e: self.toggle_speed())
+        for k in ("q", "Q", "<Escape>"):
+            self.root.bind(k, lambda _e: self.root.destroy())
 
     # ---------- 片段切換與標記 ----------
 
@@ -182,8 +198,12 @@ class LabelTool:
     def _update_info(self):
         key = self.keys[self.idx]
         cur = self.store.get(key)
-        mark = f"|| 目前標記:{NAME_OF.get(cur['label'], cur['label'])}" \
-            if cur else "|| 未標記"
+        if cur:
+            mark = f"|| 目前標記:{display_name(cur['label'])}"
+            if cur["label"] in LEGACY_CODES:
+                mark += "  ← 舊類別,建議用新清單複標"
+        else:
+            mark = "|| 未標記"
         rate = self.pose_rate.get(key)
         pose_txt = (f"骨架關聯 {rate:.0%}" if rate is not None
                     else "無節點資料")
@@ -191,15 +211,19 @@ class LabelTool:
             f"第 {self.idx + 1} / {len(self.clips)} 段  "
             f"{os.path.basename(self.clips[self.idx])}  {mark}"
             f"   [{pose_txt}](速度 {self.speed}x)")
+
+        # 進度以「訓練用的合併類別」統計 —— 細類太多,逐類看沒有意義,
+        # 真正要盯的是合併後每一類夠不夠
         done = self.store.count_labeled(self.keys)
-        n_pos = sum(1 for k in self.keys
-                    if (self.store.get(k) or {}).get("label") == "smoking")
-        n_bad = sum(1 for k in self.keys
-                    if (self.store.get(k) or {}).get("label") == "bad_pose")
+        cnt = Counter()
+        for k in self.keys:
+            lab = (self.store.get(k) or {}).get("label")
+            if lab is not None:
+                cnt[MERGE.get(lab, "不進訓練")] += 1
+        stats = "  ".join(f"{c} {cnt.get(c, 0)}" for c in TRAIN_CLASSES)
         self.progress_var.set(
-            f"進度:已標 {done} / {len(self.clips)}"
-            f"(抽菸 {n_pos},非抽菸 {done - n_pos - n_bad},"
-            f"骨架錯誤排除 {n_bad})   標籤檔:{LABELS_PATH}")
+            f"進度:已標 {done} / {len(self.clips)}   {stats}   "
+            f"不進訓練 {cnt.get('不進訓練', 0)}   標籤檔:{LABELS_PATH}")
 
     def goto(self, idx: int):
         self.idx = max(0, min(len(self.clips) - 1, idx))
