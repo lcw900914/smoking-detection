@@ -53,6 +53,8 @@ class DemoGUI:
             cfg_all = load_config(infer_config)
             self._init_move_gate = bool(
                 cfg_all.get("move_gate", {}).get("enabled", True))
+            self._init_wander_alert = bool(
+                cfg_all.get("presence", {}).get("alert_wandering", False))
             esc = cfg_all.get("escalation", {})
             self._init_dwell_min = float(esc.get("min_dwell", 2.0))
             self._init_dwell_max = float(esc.get("max_dwell", 5.0))
@@ -60,6 +62,7 @@ class DemoGUI:
             self._init_trigger, self._init_release = 0.75, 0.4
             self._init_min_events = 3
             self._init_move_gate = True
+            self._init_wander_alert = False
             self._init_dwell_min, self._init_dwell_max = 2.0, 5.0
         root.title("抽菸行為偵測 Demo — channel-as-temporal-buffer")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -203,6 +206,14 @@ class DemoGUI:
                         command=self._apply_thresholds).pack(
             anchor="w", pady=2)
 
+        # 徘徊通報開關(預設關):有人在鏡頭裡一直繞但沒離開 → 橘色警示。
+        # 與抽菸警報是不同語意的事件,不影響紅色警報與 P_t
+        self.wander_var = tk.BooleanVar(value=self._init_wander_alert)
+        ttk.Checkbutton(thr, text="徘徊時通報(橘色,非抽菸警報)",
+                        variable=self.wander_var,
+                        command=self._apply_thresholds).pack(
+            anchor="w", pady=2)
+
         # 診斷訊息開關(預設關):校準時才顯示未計入/未達門檻的原因
         # 注意:工作執行緒不可直接讀 tk 變數(tkinter 非執行緒安全),
         # 由 _apply_thresholds 在主執行緒快取成 _diag_enabled
@@ -324,6 +335,7 @@ class DemoGUI:
             except (tk.TclError, ValueError):
                 pass
             self.pipeline.move_gate_enabled = bool(self.move_gate_var.get())
+            self.pipeline.wander_alert_enabled = bool(self.wander_var.get())
             try:
                 dmin = float(self.dwell_min_var.get())
                 dmax = float(self.dwell_max_var.get())
@@ -381,6 +393,16 @@ class DemoGUI:
                         time.strftime("%H:%M:%S") +
                         f"  track {tid} 停留 {dwell:.1f} 秒 {mark} {reason}")
             pipeline.on_event = log_event
+
+            # 徘徊通報:與抽菸警報同樣列進記錄(不受診斷開關影響),
+            # 但不錄片段、不改 P_t —— 它是另一種事件,不是抽菸的證據
+            def log_wander(tid, stay, path):
+                self.alarm_q.put({
+                    "text": time.strftime("%H:%M:%S") +
+                            f"  ◆ track {tid} 徘徊(在場 {stay:.0f} 秒,"
+                            f"移動 {path:.1f} 倍身高)",
+                    "rec": None})
+            pipeline.on_presence = log_wander
             pipeline.on_log = lambda msg: (
                 self.alarm_q.put(time.strftime("%H:%M:%S") + "  " + msg)
                 if self._diag_enabled else None)

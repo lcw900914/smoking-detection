@@ -61,6 +61,7 @@ class TrackState:
     moving: bool = False         # 視窗內移動 ≥ N 倍身高
     presence: Optional[PresenceClassifier] = None
     presence_state: str = "unknown"   # 經過 / 徘徊 / 等待
+    wander_notified: bool = False     # 徘徊已通報(每個 track 只報一次)
     skeleton: Optional[SkeletonStageEstimator] = None
     loiter: Optional[LoiterDetector] = None
     last_seen: float = 0.0
@@ -146,6 +147,12 @@ class SmokingDetectionPipeline:
         self.on_event = None
         # 自由格式診斷訊息(接近未達標等)
         self.on_log = None
+        # 徘徊通報(GUI 可開關,預設關):徘徊不是抽菸,走橘色警示而非
+        # 紅色警報,也不碰 P_t —— 兩者是不同語意的事件,不該混在一起
+        self.presence_cfg = infer_cfg.get("presence", {})
+        self.wander_alert_enabled = bool(
+            self.presence_cfg.get("alert_wandering", False))
+        self.on_presence = None   # (track_id, 在場秒數, 累積路徑)
         self._dwell_override = None  # GUI 即時調整停留窗口用
 
         # 移動排除(可開關):走動中(累積移動 ≥ N 倍身高)不視為抽菸
@@ -195,7 +202,7 @@ class SmokingDetectionPipeline:
                         wrist_vis_max=lo.get("wrist_vis_max", 0.1))
             esc = self.cfg.get("escalation", {})
             lv = esc.get("levels", {"low": 0.2, "mid": 0.5, "high": 0.8})
-            pr = self.cfg.get("presence", {})
+            pr = self.presence_cfg
             self._tracks[tid] = TrackState(
                 buffer=buffer,
                 state_machine=StageStateMachine(
@@ -263,6 +270,15 @@ class SmokingDetectionPipeline:
             # 與骨架分支是否啟用無關
             if st.presence is not None:
                 st.presence_state = st.presence.update(timestamp, smoothed)
+                # 徘徊通報:每個 track 只報一次。不因狀態在
+                # 徘徊/等待門檻附近抖動而重複通報 —— 人還在原地,
+                # 一次就夠;離場後 track 回收,重新進場才會再報
+                if (self.wander_alert_enabled and not st.wander_notified
+                        and st.presence_state == PresenceClassifier.WANDERING):
+                    st.wander_notified = True
+                    if self.on_presence is not None:
+                        stay, path, _span, _speed = st.presence.stats()
+                        self.on_presence(tid, stay, path)
             boxes.append(smoothed)
             tids.append(tid)
             if self.use_model:
@@ -385,6 +401,10 @@ class SmokingDetectionPipeline:
                 "level": st.counter.score(),
                 "loiter": st.loitering,
                 "presence": st.presence_state,
+                # 徘徊警示:只在使用者開啟時成立(橘色,不影響紅色警報)
+                "wander_alert": (self.wander_alert_enabled
+                                 and st.presence_state
+                                 == PresenceClassifier.WANDERING),
                 "orientation": ori,
                 "unverified": st.unverified,
                 "moving": self.move_gate_enabled and st.moving,
@@ -557,8 +577,8 @@ def draw_overlay(frame: np.ndarray, results: Dict[int, dict]) -> np.ndarray:
         level = r.get("level", 0.0)
         if r["alarm"]:
             color = (0, 0, 255)          # 紅:警報
-        elif r.get("unverified") or r.get("loiter"):
-            color = (0, 165, 255)        # 橘:無法確認 / 逗留警告
+        elif r.get("unverified") or r.get("loiter") or r.get("wander_alert"):
+            color = (0, 165, 255)        # 橘:無法確認 / 逗留 / 徘徊警示
         elif level >= 0.5:
             color = (0, 200, 255)        # 黃:中警戒
         else:
