@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import cv2  # noqa: E402
+import numpy as np  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
 
 from utils import load_config  # noqa: E402
@@ -74,7 +75,17 @@ class DemoGUI:
         self.CLIP_PRE_FRAMES = 100     # 約 10 秒 @10fps
         self.CLIP_POST_SEC = 4.0
         self.clip_buffer: deque = deque(maxlen=self.CLIP_PRE_FRAMES)
+        # 節點滾動緩衝(與 clip_buffer 同步):錄乾淨影像時畫面上沒有
+        # 紅框,stage2/extract_pose.py 事後無法回抽對象,節點只能在
+        # 錄影當下就落地。每幀存 {track id: (kpts, bbox)},成本近零。
+        self.pose_buffer: deque = deque(maxlen=self.CLIP_PRE_FRAMES)
         self._active_recs = []         # 錄製中的警報片段
+        # 錄影疊加開關(預設關 = 錄乾淨影像)。要訓練「看畫面」的模型
+        # 就必須有沒烙印骨架線與文字的原始影格,印上去救不回來;
+        # 畫面顯示不受影響,一律照常疊加。
+        # 影像執行緒只讀這個快取的 bool,不直接碰 tk 變數(非執行緒安全)
+        self._clip_overlay = False
+        self._clip_overlay_applied = False
 
         # 條列式記錄(分頁)
         self.log_entries = []          # 最新在前;{'text', 'rec'}
@@ -202,6 +213,14 @@ class DemoGUI:
                         command=self._apply_thresholds).pack(
             anchor="w", pady=2)
 
+        # 錄影疊加開關(預設關):關 = 存乾淨原始影像(蒐集訓練資料用),
+        # 開 = 存與畫面相同的疊加版(給人複查用)。只影響存檔,不影響顯示
+        self.clip_overlay_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(thr, text="錄影疊加骨架(蒐集訓練資料請關閉)",
+                        variable=self.clip_overlay_var,
+                        command=self._apply_thresholds).pack(
+            anchor="w", pady=2)
+
         # 下:控制列
         ctrl = ttk.Frame(main, padding=(0, 6))
         ctrl.grid(row=2, column=0, columnspan=2, sticky="ew")
@@ -290,8 +309,9 @@ class DemoGUI:
         # 主執行緒快取診斷開關,供影像執行緒安全讀取
         try:
             self._diag_enabled = bool(self.diag_var.get())
-        except tk.TclError:
-            pass
+            self._clip_overlay = bool(self.clip_overlay_var.get())
+        except (tk.TclError, AttributeError):
+            pass  # 版面尚未建完(滑桿 trace 可能先觸發)
         if self.pipeline is not None:
             self.pipeline.alarm.trigger = self.trigger_var.get()
             # 解除線夾在 [0.01, 觸發線-0.01]:觸發線拉到 0 時
@@ -340,7 +360,8 @@ class DemoGUI:
                 # 開始錄警報片段:帶入觸發前的緩衝影格,續錄 POST 秒
                 rec = {"tid": tid, "trigger_t": t,
                        "end_t": t + self.CLIP_POST_SEC,
-                       "frames": list(self.clip_buffer), "path": None}
+                       "frames": list(self.clip_buffer),
+                       "pose": list(self.pose_buffer), "path": None}
                 self._active_recs.append(rec)
                 self.alarm_q.put({
                     "text": time.strftime("%H:%M:%S") +
@@ -415,7 +436,9 @@ class DemoGUI:
                 last_proc = ts
             vis = draw_overlay(frame, results)
             if do_step:
-                self._record_clip_frame(vis, ts)
+                # 存檔用哪一份由開關決定:關 = 乾淨原始影格(可訓練外觀模型)
+                self._record_clip_frame(
+                    vis if self._clip_overlay else frame, ts, results)
             try:
                 self.frame_q.put_nowait((vis, dict(results)))
             except queue.Full:
@@ -468,16 +491,39 @@ class DemoGUI:
 
     # ---------- 警報片段錄製 ----------
 
-    def _record_clip_frame(self, vis, ts):
-        """收一張取樣影格進滾動緩衝(縮小到寬 ≤960 節省記憶體),
-        並推進進行中的警報片段錄製。"""
-        h, w = vis.shape[:2]
+    def _record_clip_frame(self, img, ts, results):
+        """收一張取樣影格與該幀節點進滾動緩衝,並推進進行中的片段錄製。
+
+        img 已由呼叫端依「錄影疊加」開關選好:乾淨原始影格或疊加影格
+        (縮小到寬 ≤960 節省記憶體)。results 是該幀所有 track 的推理
+        結果,節點從這裡取。
+        """
+        # 開關切換時清掉緩衝,免得同一段片子前半乾淨、後半有疊加
+        # (在影像執行緒內處理,不與主執行緒搶 deque;
+        #  節點緩衝一起清,兩者長度才對得起來)
+        if self._clip_overlay != self._clip_overlay_applied:
+            self.clip_buffer.clear()
+            self.pose_buffer.clear()
+            self._clip_overlay_applied = self._clip_overlay
+        h, w = img.shape[:2]
         if w > 960:
             s = 960 / w
-            vis = cv2.resize(vis, (960, int(h * s)))
-        self.clip_buffer.append(vis)
+            img = cv2.resize(img, (960, int(h * s)))
+        else:
+            img = img.copy()   # 原始影格可能被擷取端重複使用,務必複製
+        # 節點以「原始影像座標」保存,不隨上面的縮放改變 ——
+        # stage2 的正規化本來就會除掉尺度,存原始座標最不失真
+        snap = {
+            tid: (None if r.get("kpts") is None
+                  else np.asarray(r["kpts"], np.float32).copy(),
+                  np.asarray(r["bbox"], np.float32).copy())
+            for tid, r in results.items()
+        }
+        self.clip_buffer.append(img)
+        self.pose_buffer.append((ts, snap))
         for rec in self._active_recs[:]:
-            rec["frames"].append(vis)
+            rec["frames"].append(img)
+            rec["pose"].append((ts, snap))
             if ts >= rec["end_t"]:
                 self._active_recs.remove(rec)
                 threading.Thread(target=self._write_clip, args=(rec,),
@@ -501,6 +547,45 @@ class DemoGUI:
             vw.write(f)
         vw.release()
         rec["path"] = str(path)
+        self._write_pose(rec, path)
+
+    def _write_pose(self, rec, clip_path):
+        """把警報對象的節點序列存成 annotations/pose/{片段檔名}.npz。
+
+        輸出格式刻意與 stage2/extract_pose.py 完全一致(kpts / bbox /
+        valid / fps / clip),stage2 的資料集與訓練腳本都不必改。
+
+        存在的理由:extract_pose.py 是靠畫面上烙印的紅色警報框回頭定位
+        「被警報的是哪個人」。一旦改錄乾淨影像(訓練外觀模型的前提),
+        那條路就斷了 —— 節點只能在錄影的當下直接落地,而且這樣拿到的
+        是追蹤器原本就認定的對象,比事後用顏色遮罩反推更準。
+        """
+        seq = rec.get("pose") or []
+        if not seq:
+            return
+        tid = rec["tid"]
+        T = len(seq)
+        kpts = np.zeros((T, 17, 3), np.float32)
+        bbox = np.zeros((T, 4), np.float32)
+        valid = np.zeros(T, bool)
+        for t, (_ts, snap) in enumerate(seq):
+            item = snap.get(tid)
+            if item is None:
+                continue            # 該幀這個 track 沒被偵測到
+            k, b = item
+            bbox[t] = b
+            if k is not None:
+                kpts[t] = k
+                valid[t] = True
+        out_dir = Path("annotations/pose")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dst = out_dir / (Path(clip_path).stem + ".npz")
+        np.savez_compressed(
+            dst, kpts=kpts, bbox=bbox, valid=valid, fps=10.0,
+            clip=str(Path(clip_path).as_posix()))
+        self.alarm_q.put(
+            time.strftime("%H:%M:%S") +
+            f"  節點已存 {dst.name}({int(valid.sum())}/{T} 幀有骨架)")
 
     # ---------- 條列式記錄(分頁)與回放 ----------
 
