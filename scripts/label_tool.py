@@ -5,7 +5,7 @@
     python scripts/label_tool.py --dir <其他資料夾>
 
 操作:
-    1-6 = 動作類別   8/9/0 = 排除(類別表見 stage2/taxonomy.py)
+    1-8 = 動作類別   9/0/- = 排除(類別表見 stage2/taxonomy.py)
     ←/→ = 上一段/下一段   F 或空白鍵 = 播放速度 1x/2x   Q 或 Esc = 離開
 
 行為:
@@ -13,8 +13,10 @@
 - 啟動時自動跳到第一段未標記的片段;已標記的片段會顯示目前標籤
 - 標記後自動跳下一段未標記
 - 只標手部動作。經過/徘徊/等待這類移動型態由框的軌跡自動算,不用標
-- 類別刻意不細分:手臂只有肩/肘/腕三個節點,推眼鏡與摸鼻子在特徵
-  空間裡分不開,分開標只會製造雜訊(理由詳見 stage2/taxonomy.py)
+- 2026-08 起「手碰臉」拆成扶眼鏡 / 抓頭髮 / 其他碰臉三顆:兩層模型看的是
+  片段(停留位置 × 時長 × 速度),這三者在那個空間裡分得開(理由詳見
+  stage2/taxonomy.py)。2026-07 標的 other_neg / desk_work 是粗類,
+  裡面混著扶眼鏡與抓頭髮,做六分類前建議用新按鈕複標
 """
 import argparse
 import glob
@@ -33,9 +35,9 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import cv2  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
 
-from stage2.taxonomy import (CATEGORIES, EXAMPLES, GROUPS,  # noqa: E402
-                             LEGACY_CODES, MERGE, TRAIN_CLASSES,
-                             display_name)
+from stage2.taxonomy import (CATEGORIES, DEEP_CLASSES,  # noqa: E402
+                             DEEP_NAMES, EXAMPLES, GROUPS, LEGACY_CODES,
+                             deep_index, display_name)
 
 LABELS_PATH = Path("annotations/clip_labels.json")
 
@@ -212,15 +214,18 @@ class LabelTool:
             f"{os.path.basename(self.clips[self.idx])}  {mark}"
             f"   [{pose_txt}](速度 {self.speed}x)")
 
-        # 進度以「訓練用的合併類別」統計 —— 細類太多,逐類看沒有意義,
-        # 真正要盯的是合併後每一類夠不夠
+        # 進度以「深層類別」統計 —— 細類逐類看沒有意義,真正要盯的是
+        # 兩層模型的六個輸出類別每一類夠不夠(尤其抽菸正樣本)
         done = self.store.count_labeled(self.keys)
         cnt = Counter()
         for k in self.keys:
             lab = (self.store.get(k) or {}).get("label")
-            if lab is not None:
-                cnt[MERGE.get(lab, "不進訓練")] += 1
-        stats = "  ".join(f"{c} {cnt.get(c, 0)}" for c in TRAIN_CLASSES)
+            if lab is None:
+                continue
+            i = deep_index(lab)
+            cnt[DEEP_CLASSES[i] if i is not None else "不進訓練"] += 1
+        stats = "  ".join(f"{DEEP_NAMES[c]} {cnt.get(c, 0)}"
+                          for c in DEEP_CLASSES)
         self.progress_var.set(
             f"進度:已標 {done} / {len(self.clips)}   {stats}   "
             f"不進訓練 {cnt.get('不進訓練', 0)}   標籤檔:{LABELS_PATH}")
