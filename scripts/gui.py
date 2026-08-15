@@ -233,6 +233,11 @@ class DemoGUI:
         self.alarm_q: "queue.Queue" = queue.Queue()
         self.alarm_meta_q: "queue.Queue" = queue.Queue()
         self._show_skeleton = True
+        self._sw_smoke = True
+        self._sw_wander = False
+        self._sw_wait = False
+        self._load_failed = False
+        self._rate_text = ""
         # 錄影分頁(獨立於偵測:不解碼、不吃 GPU,兩者可同時開著)
         self.recorder = None
         self.rec_thread: threading.Thread = None
@@ -960,6 +965,23 @@ class DemoGUI:
         if p:
             self.ckpt_var.set(p)
 
+    def _sync_switch_cache(self) -> None:
+        """把開關現值抄進普通屬性(主執行緒專用)。背景執行緒只讀快取。"""
+        self._show_skeleton = bool(self.show_skel_var.get())
+        self._sw_smoke = bool(self.alarm_smoke_var.get())
+        self._sw_wander = bool(self.alarm_wander_var.get())
+        self._sw_wait = bool(self.alarm_wait_var.get())
+        # 錄影疊加是設定值不是開關:蒐集訓練資料時必須是乾淨影像,
+        # 烙印上去救不回來,所以放在參數表而不是隨手可按的位置
+        self._clip_overlay = bool(
+            self.current_config().get("alarm", {}).get("clip_overlay", False))
+
+    def _push_switches(self, pipeline) -> None:
+        """把快取好的開關套到管線(哪個執行緒呼叫都安全)。"""
+        pipeline.smoking_alarm_enabled = self._sw_smoke
+        pipeline.wander_alert_enabled = self._sw_wander
+        pipeline.wait_alert_enabled = self._sw_wait
+
     def _apply_switches(self, _=None):
         """把四個開關套到執行中的管線。
 
@@ -968,18 +990,11 @@ class DemoGUI:
         等於參數表白設,兩邊還互相矛盾。
         """
         try:
-            self._show_skeleton = bool(self.show_skel_var.get())
+            self._sync_switch_cache()
         except (tk.TclError, AttributeError):
             return                      # 版面還沒建完
-        # 錄影疊加是設定值不是開關:蒐集訓練資料時必須是乾淨影像,
-        # 烙印上去救不回來,所以放在參數表裡而不是隨手可按的地方
-        self._clip_overlay = bool(
-            self.current_config().get("alarm", {}).get("clip_overlay", False))
-        if self.pipeline is None:
-            return
-        self.pipeline.smoking_alarm_enabled = bool(self.alarm_smoke_var.get())
-        self.pipeline.wander_alert_enabled = bool(self.alarm_wander_var.get())
-        self.pipeline.wait_alert_enabled = bool(self.alarm_wait_var.get())
+        if self.pipeline is not None:
+            self._push_switches(self.pipeline)
 
     def start(self):
         if self.running:
@@ -997,17 +1012,27 @@ class DemoGUI:
                 "缺少權重",
                 f"方法「{method.name}」需要外觀網路權重,請在「權重」欄指定。")
             return
+        # tkinter 不是執行緒安全的:tk 變數必須在**主執行緒**讀完再交給
+        # 背景執行緒。先前 _start_worker 裡直接呼叫 current_config() 與
+        # _apply_switches(兩者都讀 tk 變數),整個管線在「main thread is
+        # not in main loop」掛掉 —— 畫面只顯示「載入失敗」,於是警報、
+        # 片段、節點通通沒有。
+        cfg = self.current_config()
+        ckpt = self.ckpt_var.get().strip()
+        src = self.source_var.get().strip()
+        self._sync_switch_cache()
         self.start_btn.config(state="disabled")
         self.status_var.set("載入模型中…")
-        threading.Thread(target=self._start_worker, args=(method,),
-                         daemon=True).start()
+        threading.Thread(target=self._start_worker,
+                         args=(method, cfg, ckpt, src), daemon=True).start()
 
-    def _start_worker(self, method):
-        """在背景執行緒載入 pipeline(避免凍住 UI),然後開始處理。"""
+    def _start_worker(self, method, infer_cfg, ckpt, src):
+        """在背景執行緒載入 pipeline(避免凍住 UI),然後開始處理。
+
+        **這裡一律不碰 tk 變數**:設定與開關都由主執行緒先讀好傳進來。
+        """
         try:
             from inference.pipeline import SmokingDetectionPipeline
-            infer_cfg = self.current_config()
-            ckpt = self.ckpt_var.get().strip()
             # 要不要載外觀網路由方法決定,不再由「權重欄有沒有填」決定 ——
             # 否則選了純規則卻忘了清空權重欄,跑的其實是融合版
             use_model = method.needs_appearance
@@ -1070,23 +1095,23 @@ class DemoGUI:
             pipeline.on_log = lambda msg: self.alarm_q.put(
                 time.strftime("%H:%M:%S") + "  " + msg)
             self.pipeline = pipeline
-            # 套用目前滑桿值(使用者的調整優先,不被設定檔覆蓋)
-            self._apply_switches()
-        except Exception as e:  # 載入失敗回報到 UI
+            self._push_switches(pipeline)      # 用主執行緒抄好的快取
+        except Exception as e:  # 載入失敗回報到 UI(訊息走診斷框)
             self.alarm_q.put(f"[錯誤] 模型載入失敗:{e}")
-            self.root.after(0, lambda: (
-                self.start_btn.config(state="normal"),
-                self.status_var.set("載入失敗")))
+            self.running = False
+            self._load_failed = True
             return
 
+        # 不從背景執行緒碰 tk(連 root.after 都不行——tkinter 非執行緒
+        # 安全,實測會丟 main thread is not in main loop,而且**整條執行緒
+        # 當場死掉**,連影像迴圈都沒跑到,於是既沒有畫面也沒有警報片段)。
+        # 只放旗標,按鈕由 _poll_ui 在主執行緒同步。
         self.running = True
-        self.root.after(0, lambda: (
-            self.stop_btn.config(state="normal"),
-            self.status_var.set("執行中")))
-        self._video_loop()
+        self._video_loop(src)
 
-    def _video_loop(self):
-        src = self.source_var.get().strip()
+    def _video_loop(self, src: str):
+        """影像迴圈(背景執行緒)。src 由主執行緒讀好傳進來——這裡不碰
+        任何 tk 變數。"""
         from inference.stream import VideoSource
         from inference.pipeline import draw_overlay
         try:
@@ -1096,7 +1121,6 @@ class DemoGUI:
         except Exception as e:
             self.alarm_q.put(f"[錯誤] 無法開啟來源:{e}")
             self.running = False
-            self.root.after(0, self._reset_buttons)
             return
         self.alarm_q.put(f"[資訊] 來源={vs.kind} fps={vs.fps:.1f}")
 
@@ -1133,10 +1157,8 @@ class DemoGUI:
                     if getattr(vs, "queued", False):
                         extra = (f" 佇列{len(vs._queue)}"
                                  f" 落後比{vs.lag_ratio:.2f}")
-                    # tk 變數只能在主執行緒改
-                    self.root.after(
-                        0, lambda r=rate, e=extra:
-                        self.status_var.set(f"執行中 {r:.1f} fps{e}"))
+                    # 只放字串,由 _poll_ui 在主執行緒顯示
+                    self._rate_text = f"執行中 {rate:.1f} fps{extra}"
                     fps_t0, fps_n = time.time(), 0
             vis = draw_overlay(frame, results, self._show_skeleton)
             if do_step:
@@ -1156,7 +1178,6 @@ class DemoGUI:
         vs.release()
         self.pipeline.close()   # 收掉複核執行緒池(每次「開始」都會新建一條管線)
         self.running = False
-        self.root.after(0, self._reset_buttons)
 
     def stop(self):
         self.running = False
@@ -1230,6 +1251,21 @@ class DemoGUI:
                     self.rec_log.delete(300, tk.END)
         except queue.Empty:
             pass
+        # 偵測的按鈕狀態也由主執行緒依 self.running 同步
+        busy = str(self.stop_btn["state"]) != "disabled"
+        if self.running and not busy:
+            self.stop_btn.config(state="normal")
+            self.start_btn.config(state="disabled")
+            self.status_var.set("執行中")
+        if self.running and self._rate_text:
+            self.status_var.set(self._rate_text)
+            self._rate_text = ""
+        elif not self.running and busy:
+            self._reset_buttons()
+            if getattr(self, "_load_failed", False):
+                self._load_failed = False
+                self.status_var.set("載入失敗")
+
         # 錄影執行緒結束後由主執行緒復原按鈕(見 start_record 的說明)
         if self.recorder is None and str(self.rec_stop_btn["state"]) != \
                 "disabled":

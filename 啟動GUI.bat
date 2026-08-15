@@ -29,6 +29,9 @@ rem play), diagnostics on the right (dwell seconds, why an event did or did
 rem not count). Alarms are results, diagnostics are process -- in one shared
 rem list the calibration chatter buries the actual alarms.
 rem
+rem If the picture stops or clips stop being written, check the diagnostics
+rem box first: a failure there is reported as text rather than a crash.
+rem
 rem The status panel is three columns:
 rem     Present      people still MOVING (passing / wandering), with
 rem                  ID + behaviour + stage / count / facing-away
