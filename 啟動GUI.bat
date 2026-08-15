@@ -32,6 +32,10 @@ rem
 rem If the picture stops or clips stop being written, check the diagnostics
 rem box first: a failure there is reported as text rather than a crash.
 rem
+rem A clip normally covers 10s before the alarm and 4s after. If the source
+rem ends (or you press stop) inside that trailing 4s, the clip is written
+rem short rather than thrown away -- an incomplete clip still beats none.
+rem
 rem The status panel is three columns:
 rem     Present      people still MOVING (passing / wandering), with
 rem                  ID + behaviour + stage / count / facing-away

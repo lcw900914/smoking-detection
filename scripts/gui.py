@@ -1177,6 +1177,7 @@ class DemoGUI:
             t_prev = time.time()
         vs.release()
         self.pipeline.close()   # 收掉複核執行緒池(每次「開始」都會新建一條管線)
+        self._flush_pending_clips()
         self.running = False
 
     def stop(self):
@@ -1348,6 +1349,26 @@ class DemoGUI:
             rec["pose"].append((ts, snap))
             if ts >= rec["end_t"]:
                 self._active_recs.remove(rec)
+                threading.Thread(target=self._write_clip, args=(rec,),
+                                 daemon=True).start()
+
+    def _flush_pending_clips(self) -> None:
+        """來源結束或使用者按停止時,把還在錄的片段寫出來。
+
+        片段本來要錄到「觸發後 4 秒」才落地。但警報常常就發生在影片尾端
+        (短片、或人抽完就走出畫面),那 4 秒等不到,待寫的片段就被靜靜
+        丟掉——畫面上明明看到 ID 進了「偵測到抽菸」欄,硬碟上卻什麼都
+        沒有,而且沒有任何錯誤訊息。
+
+        寧可短一點也要留下來:那是使用者唯一的證據,而「不完整」與
+        「不存在」差很多。
+        """
+        for rec in self._active_recs[:]:
+            self._active_recs.remove(rec)
+            if rec.get("frames"):
+                self.alarm_q.put(
+                    f"[資訊] 來源結束,片段提前寫出"
+                    f"(track {rec['tid']},{len(rec['frames'])} 幀)")
                 threading.Thread(target=self._write_clip, args=(rec,),
                                  daemon=True).start()
 
