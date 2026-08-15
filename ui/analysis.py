@@ -24,7 +24,10 @@ import numpy as np
 BATCH = 4
 
 CACHE_DIR = ".analysis"
-CACHE_VERSION = 1
+# 改到會影響快取內容的東西就要 +1,否則舊側車檔會被當成有效的直接載入,
+# 使用者重開影片看到的還是上一版的結果,而且沒有任何跡象說它沒重跑。
+#   2: 標記從「警報成立時刻」改成「證據起點」(第一次抬手)
+CACHE_VERSION = 2
 
 
 class _Batcher:

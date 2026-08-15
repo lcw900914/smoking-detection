@@ -6,6 +6,7 @@
 import numpy as np
 import pytest
 
+from ui import analysis
 from ui.analysis import Analysis, CACHE_DIR, cache_path
 
 
@@ -72,6 +73,39 @@ class TestRoundTrip:
         dst.parent.mkdir(parents=True)
         dst.write_bytes("這不是 npz".encode("utf-8"))
         assert Analysis.load(str(video)) is None
+
+
+class TestCacheVersion:
+    """側車檔是靜悄悄的:版本沒跟上,使用者重開影片看到的是上一版的結果,
+    畫面上沒有任何跡象說它其實沒重跑。
+
+    這正好發生過一次——標記從「警報成立時刻」改成「證據起點」,程式改對了
+    但版本沒 +1,舊快取照載,看起來就像根本沒改。
+    """
+
+    def test_stale_version_is_discarded(self, tmp_path):
+        video = tmp_path / "clip.mp4"
+        make().save(str(video))
+        import numpy as _np
+        from ui.analysis import cache_path
+        d = dict(_np.load(cache_path(str(video)), allow_pickle=False))
+        d["version"] = _np.asarray(analysis.CACHE_VERSION - 1)
+        _np.savez_compressed(cache_path(str(video)), **d)
+        assert Analysis.load(str(video)) is None
+
+    def test_current_version_still_loads(self, tmp_path):
+        video = tmp_path / "clip.mp4"
+        make().save(str(video))
+        assert Analysis.load(str(video)) is not None
+
+    def test_version_is_written_not_assumed(self, tmp_path):
+        """讀的時候拿不到 version 會丟例外,那 load 就永遠回 None。"""
+        import numpy as _np
+        from ui.analysis import cache_path
+        video = tmp_path / "clip.mp4"
+        make().save(str(video))
+        d = _np.load(cache_path(str(video)), allow_pickle=False)
+        assert int(d["version"]) == analysis.CACHE_VERSION
 
 
 class TestTruthiness:
