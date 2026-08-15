@@ -93,9 +93,21 @@ class SkeletonStageEstimator:
         # 幻覺腕點恆定「可見」,不會走這條路
         self._none_arm_frames = max(2, int(0.5 * fps))
         self._none_count = 0   # 連續「正面但量不到腕點」幀數(武裝用)
+        # 手離開臉部區域(d ≥ near_eff)持續這麼多幀也可武裝,不必退到
+        # near+rise_margin 那麼遠。手肘撐著、手在胸口與嘴之間小幅來回的
+        # 抽菸姿勢永遠退不到 1.4 身體尺度,原本第一口之後就再也武裝不了,
+        # 次數卡在 1、到不了 min_events。幻覺腕點的 d 恆定落在 near 以內,
+        # 走不到這條路,所以放寬不會把它放進來
+        self._above_arm_frames = max(2, int(1.0 * fps))
+        self._above_count = 0
         self._gap_count = 0    # 連續無有效距離量測幀數(任何棄權路徑)
         self.lookback = max(2, int(0.6 * fps))
-        self._hist: deque = deque(maxlen=int(3 * fps))  # d_norm 歷史
+        self.lookback_sec = 0.6
+        # (t, d_norm, 用的是哪隻腕點)。存時間而不是只存值:索引式回看
+        # 假設呼叫頻率固定,但等待閘門會整段跳過 update(),轉回候選時
+        # 「6 格前」可能是好幾秒前。存腕點編號是因為 d 取左右較近者——
+        # 換手時 delta 比較的是兩隻不同的手,會憑空生出 S1/S3
+        self._hist: deque = deque(maxlen=int(3 * fps))
 
     def _body_scale(self, kpts: np.ndarray) -> Optional[float]:
         """身體尺度基準:max(肩寬, 0.55×軀幹高)。
@@ -114,29 +126,35 @@ class SkeletonStageEstimator:
             scale = max(scale, 0.55 * torso_h)
         return scale if scale > 1e-3 else None
 
-    def _wrist_nose_dist(self, kpts: np.ndarray) -> Optional[float]:
-        """正規化腕-鼻距離(取左右腕較近者);關鍵點不可見時回傳 None。
+    def _wrist_nose_dist(self, kpts: np.ndarray):
+        """正規化腕-鼻距離(取左右腕較近者)與用到的腕點編號。
 
         鼻點採較嚴門檻 nose_conf:S2 的語意依賴鼻子位置可信。
+        回傳 (d, wrist) 或 (None, None)——wrist 給呼叫端判斷有沒有換手。
         """
         if kpts[NOSE, 2] < self.nose_conf:
-            return None
+            return None, None
         scale = self._body_scale(kpts)
         if scale is None:
-            return None
+            return None, None
         dists = [
-            float(np.linalg.norm(kpts[w, :2] - kpts[NOSE, :2])) / scale
+            (float(np.linalg.norm(kpts[w, :2] - kpts[NOSE, :2])) / scale, w)
             for w in (L_WRI, R_WRI) if kpts[w, 2] >= self.kpt_conf
         ]
-        return min(dists) if dists else None
+        return min(dists) if dists else (None, None)
 
-    def update(self, kpts: Optional[np.ndarray]
+    def update(self, kpts: Optional[np.ndarray],
+               timestamp: Optional[float] = None
                ) -> Tuple[int, Optional[float], str]:
         """推入一幀關鍵點 (17, 3),回傳 (stage_id, d_norm, orientation)。
 
         stage_id 與全專案一致:0=S1、1=S2、2=S3、3=背景。
         kpts 為 None 或判定背向時棄權:回報背景、不產生 S2。
+
+        timestamp 省略時退回索引式回看(呼叫頻率固定才成立);傳入時
+        S1/S3 的「0.6 秒前」以真實時間回查,呼叫被跳過也不會錯亂。
         """
+        self._now = timestamp
         if kpts is None:
             # 無姿態(track 偵測閃爍):可武裝——真動作中斷後重現
             # 手在嘴仍該續判;幻覺案例的姿態是恆定存在的
@@ -156,7 +174,7 @@ class SkeletonStageEstimator:
             self._abstain(arm=False)
             return 3, None, ori
 
-        d = self._wrist_nose_dist(kpts)
+        d, wrist = self._wrist_nose_dist(kpts)
         if d is None:
             # 正面但量不到腕-鼻距離(手出畫面/垂下未偵測):
             # 持續一段時間即可武裝——手顯然不在臉部
@@ -164,7 +182,7 @@ class SkeletonStageEstimator:
             return 3, None, ori
         self._none_count = 0
         self._gap_count = 0
-        self._hist.append(d)
+        self._hist.append((timestamp, d, wrist))
 
         # 距離自適應門檻:加上關鍵點像素誤差的相對餘裕
         # (近距離 scale 大 → 餘裕趨近 0;遠距離自動放寬)
@@ -173,6 +191,7 @@ class SkeletonStageEstimator:
         # S2:手在嘴部——僅在「由遠而近」(armed)時採信;
         # 每口之間手須放回遠處(≥ near+rise_margin)才能再武裝
         if d < near_eff:
+            self._above_count = 0
             if self._in_s2 or self._armed:
                 self._in_s2 = True
                 self._armed = False
@@ -180,18 +199,48 @@ class SkeletonStageEstimator:
             return 3, d, ori   # 手在臉部但未經舉手:視為遮擋誤定位,不採信
         self._in_s2 = False
         if d >= near_eff + self.rise_margin:
-            self._armed = True  # 手已離臉夠遠
+            self._armed = True      # 手已離臉夠遠(強證據,立刻武裝)
+            self._above_count = 0
+        else:
+            # 只是離開臉部區域:持續夠久也算放下過(見 __init__ 的說明)
+            self._above_count += 1
+            if self._above_count >= self._above_arm_frames:
+                self._armed = True
 
         # 與 0.6 秒前比較,判斷靠近(S1)或離開(S3)
-        if len(self._hist) > self.lookback:
-            past = self._hist[-1 - self.lookback]
-            if not np.isnan(past):
-                delta = past - d
-                if delta > self.move and d < near_eff + 2 * self.move:
-                    return 0, d, ori   # 明顯縮小且已接近 → S1 舉手
-                if -delta > self.move and past < near_eff + self.move:
-                    return 2, d, ori   # 自嘴部附近明顯拉大 → S3 放下
+        past = self._past_dist(timestamp, wrist)
+        if past is not None:
+            delta = past - d
+            if delta > self.move and d < near_eff + 2 * self.move:
+                return 0, d, ori   # 明顯縮小且已接近 → S1 舉手
+            if -delta > self.move and past < near_eff + self.move:
+                return 2, d, ori   # 自嘴部附近明顯拉大 → S3 放下
         return 3, d, ori
+
+    def _past_dist(self, now: Optional[float], wrist: int) -> Optional[float]:
+        """取約 0.6 秒前、**同一隻手**的距離;取不到回傳 None。
+
+        換手不比較:d 取左右腕較近者,兩隻手的距離序列混在一起時,
+        「較近的手換了一隻」會被讀成手快速靠近或遠離,憑空生出 S1/S3。
+        托腮(一手固定在臉旁)同時另一手抬起,正好構成這個情境。
+        """
+        if now is None:
+            # 沒有時間資訊:退回索引式回看(舊行為)
+            if len(self._hist) <= self.lookback:
+                return None
+            t_p, d_p, w_p = self._hist[-1 - self.lookback]
+            return d_p if (d_p is not None and w_p == wrist) else None
+        # 由新到舊找第一個夠久遠的樣本;太久遠(> 2 倍回看)不採信,
+        # 那多半是閘門或追蹤中斷造成的空窗,不是連續動作
+        for t_p, d_p, w_p in reversed(self._hist):
+            if t_p is None or d_p is None:
+                continue
+            age = now - t_p
+            if age >= self.lookback_sec:
+                if age > 2 * self.lookback_sec or w_p != wrist:
+                    return None
+                return d_p
+        return None
 
     def _abstain(self, arm: bool) -> None:
         """棄權路徑的共同狀態維護。
@@ -200,7 +249,8 @@ class SkeletonStageEstimator:
           之後須重新武裝;否則殘留的 _in_s2 會讓幻覺腕點繞過武裝機制)
         - arm=True 的路徑(正面但量不到手)累積夠久 → 武裝
         """
-        self._hist.append(np.nan)
+        self._hist.append((getattr(self, "_now", None), None, -1))
+        self._above_count = 0
         self._gap_count += 1
         if self._gap_count >= self._none_arm_frames:
             self._in_s2 = False

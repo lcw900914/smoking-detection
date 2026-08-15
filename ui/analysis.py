@@ -115,8 +115,66 @@ class Analysis:
             return None          # 側車檔壞了就當沒有,重新分析即可
 
 
+DEFAULT_INFER_CONFIG = ("configs/inference_hmdb.yaml"
+                        if Path("configs/inference_hmdb.yaml").exists()
+                        else "configs/inference.yaml")
+"""與 GUI 同一套解析規則。
+
+先前這裡固定用 `inference.yaml`,而 GUI 傳的是 `inference_hmdb.yaml`——
+兩份的門檻差很多(min_events 3 vs 2、trigger 0.75 vs 0.6、skeleton 關 vs
+開),同一支影片同一個方法會跑出不同結果。稽核時我自己就先被騙了一次:
+用預設設定分析得到 0 個標記,換一份才有。
+"""
+
+
+def _min_seconds_to_alarm(cfg: dict) -> float:
+    """在等待閘門下,一段影片至少要多長才可能觸發警報。
+
+    等待要在場滿 long_stay 秒才成立,之後還要湊滿 min_events 次事件,
+    每次至少 min_dwell 秒、彼此至少隔 min_gap 秒,最後 P 還要持續超過
+    觸發線 sustain_sec 秒。
+    """
+    pr, al, esc = cfg["presence"], cfg["alarm"], cfg["escalation"]
+    n = max(1, int(al.get("min_events", 2)))
+    per = float(esc.get("min_dwell", 2.0)) + float(esc.get("min_gap", 2.0))
+    return (float(pr.get("long_stay", 20.0)) + n * per
+            + float(al.get("sustain_sec", 2.0)))
+
+
+def _relax_gate_if_too_short(cfg: dict, path, log: bool) -> dict:
+    """片段短到不可能通過等待閘門時,放行閘門。
+
+    警報片段約 14 秒(前置 10 + 後錄 4),而「等待」需要在場滿 long_stay
+    秒(預設 20)。片段一播,在場時間從第一幀重新起算,**永遠到不了**,
+    於是抽菸分析從頭到尾不會啟動——實測三支真實警報片段全是 0 個標記。
+    一支確實觸發過警報的片段點進去顯示「沒有標記」,看起來像偵測壞了。
+
+    閘門的用意是省算力(見 pipeline._is_smoking_candidate),而使用者刻意
+    點開一支片段來複查時,這個理由並不成立。所以只在「結構上不可能」的
+    情況下放行,長片維持原行為,免得分析與即時偵測對不起來。
+    """
+    if not cfg.get("presence", {}).get("smoking_requires_waiting", True):
+        return cfg
+    cap = cv2.VideoCapture(str(path))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    n = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    if not (1.0 <= fps <= 240.0) or not n or n <= 0:
+        return cfg                      # 問不到長度(.ts 常見):不動它
+    need = _min_seconds_to_alarm(cfg)
+    if n / fps >= need:
+        return cfg
+    out = dict(cfg)
+    out["presence"] = dict(cfg["presence"])
+    out["presence"]["smoking_requires_waiting"] = False
+    if log:
+        print(f"[分析] 片長 {n / fps:.0f} 秒 < 通過等待閘門所需的 "
+              f"{need:.0f} 秒,本次放行閘門(否則必定 0 個標記)")
+    return out
+
+
 def analyse_video(path: str, method=None,
-                  infer_config: str = "configs/inference.yaml",
+                  infer_config: str = DEFAULT_INFER_CONFIG,
                   overrides: Optional[dict] = None,
                   on_progress: Optional[Callable] = None,
                   cancel: Optional[threading.Event] = None) -> Analysis:
@@ -135,6 +193,7 @@ def analyse_video(path: str, method=None,
     # 調好的門檻與分析標出來的位置對不起來
     from ui.settings import apply_overrides
     cfg = apply_overrides(load_config(infer_config), overrides or {})
+    cfg = _relax_gate_if_too_short(cfg, path, on_progress is not None)
     model_cfg, ckpt = None, None
     if method is not None and method.needs_appearance:
         model_cfg = load_config("configs/model.yaml")

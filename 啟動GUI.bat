@@ -22,6 +22,12 @@ rem The main screen carries only four switches -- smoking alarm, wandering
 rem alarm, waiting alarm, skeleton overlay. Every threshold lives in the
 rem method's parameter sheet instead.
 rem
+rem NOTE: this launcher is on branch fix/audit-2026-08-16, which carries the
+rem post-audit fixes (see the changelog in docs/). Differs from master:
+rem presence uses a resampled path metric, the appearance net no longer
+rem crashes with several people on screen, and alarm clips keep 20s of
+rem pre-roll instead of 10s (more RAM: roughly 310MB of rolling buffer).
+rem
 rem WORTH KNOWING: red markers point at the FIRST SUSPECTED hand-to-face,
 rem not at the moment the alarm fired. The alarm is a conclusion ("enough
 rem events, P held above the threshold") and ran 25s later on the demo clip.

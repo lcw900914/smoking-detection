@@ -215,6 +215,13 @@ class SmokingDetectionPipeline:
         # 手部擺動很像手到嘴。這比移動排除嚴格——移動排除看的是 10 秒內
         # 的位移,一個剛進畫面、型態還在「判定中」的人只要當下沒走動就
         # 攔不住;這一條看的是在場型態本身。
+        self.sequence_bonus = float(
+            self.sm_cfg.get("sequence_bonus", 0.2))
+        # 次數達標時把分數拉到剛好過觸發線(而不是拉滿 1.0)
+        self.count_floor = float(
+            self.cfg["alarm"].get("count_floor",
+                                  self.cfg["alarm"]["trigger_threshold"]
+                                  + 0.05))
         self.esc_window = float(
             self.cfg.get("escalation", {}).get("window_sec", 90.0))
         self.smoking_requires_waiting = bool(
@@ -298,14 +305,18 @@ class SmokingDetectionPipeline:
                     s2_min_dwell=self.sm_cfg["s2_min_dwell"]),
                 move_gate=MovementGate(
                     max_heights=self.mg_cfg.get("max_heights", 3.0),
-                    window_sec=self.mg_cfg.get("window_sec", 10.0)),
+                    window_sec=self.mg_cfg.get("window_sec", 10.0),
+                    path_dt=pr.get("path_dt", 0.5),
+                    path_deadband=pr.get("path_deadband", 0.05)),
                 presence=PresenceClassifier(
                     window_sec=pr.get("window_sec", 60.0),
                     short_stay=pr.get("short_stay", 8.0),
                     long_stay=pr.get("long_stay", 20.0),
                     pass_path=pr.get("pass_path", 1.0),
                     wander_path=pr.get("wander_path", 3.0),
-                    run_speed=pr.get("run_speed", 1.5)),
+                    run_speed=pr.get("run_speed", 1.5),
+                    path_dt=pr.get("path_dt", 0.5),
+                    path_deadband=pr.get("path_deadband", 0.05)),
                 pose_hist=deque(maxlen=self._pose_maxlen),
                 counter=HandToMouthCounter(
                     window_sec=esc.get("window_sec", 90.0),
@@ -334,6 +345,24 @@ class SmokingDetectionPipeline:
             return True
         return st.presence_state == PresenceClassifier.WAITING
 
+    def _rule_score(self, st: "TrackState") -> float:
+        """規則側分數:次數警戒 + 完整動作序列的加成。
+
+        次數警戒(HandToMouthCounter)本身不看手是怎麼來、怎麼走的,只要
+        S2 停留夠久就計一次。狀態機的 S1→S2→S3 順序檢查本來就是為了補這
+        一段——但它先前**只被 push、從來沒被取分**,整個順序檢查等於不存
+        在,而「動作序列」正是本專案的立論基礎。
+
+        做成加成而不是乘法門檻,是刻意的:S1 只在一個很窄的距離帶內才回
+        報,漏掉是常態(見 skeleton.py 的說明)。用它當必要條件會大量漏
+        測;當加分項則是「看得到完整序列時更有把握」,看不到也不倒扣——
+        與第二階段「降級不否決」同一個原則。
+        """
+        base = st.counter.score()
+        if self.sequence_bonus > 0.0 and st.state_machine.score() >= 1.0:
+            return min(1.0, base + self.sequence_bonus)
+        return base
+
     def _recycle_stale(self, now: float) -> None:
         """回收消失超過 recycle_sec 的 track(buffer、狀態機、警報、平滑器)。"""
         stale = [tid for tid, st in self._tracks.items()
@@ -359,7 +388,10 @@ class SmokingDetectionPipeline:
 
         results: Dict[int, dict] = {}
         rois, tids, boxes = [], [], []
-        model_tids = []          # 真的要跑外觀網路的對象(候選才進來)
+        # tid → rois/feats/net_scores 的列號。**不能用 tids 的位置索引**:
+        # 只有候選對象會收 ROI,rois 比 tids 短,位置對不起來——輕則
+        # IndexError,重則把甲的特徵推進乙的緩衝(不會出聲的那種錯)
+        model_rows: Dict[int, int] = {}
         for tid, bbox in tracked:
             st = self._get_track_state(tid)
             st.last_seen = timestamp
@@ -397,7 +429,7 @@ class SmokingDetectionPipeline:
             boxes.append(smoothed)
             tids.append(tid)
             if self.use_model and self._is_smoking_candidate(st):
-                model_tids.append(tid)
+                model_rows[tid] = len(rois)
                 roi = crop_upper_body(
                     frame, smoothed,
                     aspect_ratio=self.roi_cfg["aspect_ratio"],
@@ -416,7 +448,7 @@ class SmokingDetectionPipeline:
                     st.last_stage = BG_STAGE
                     st.last_dnorm = None
                     continue
-                stage, d, ori = st.skeleton.update(st.last_kpts)
+                stage, d, ori = st.skeleton.update(st.last_kpts, timestamp)
                 st.last_stage = stage
                 st.last_dnorm = d
                 st.ori_hist.append((timestamp, ori))
@@ -465,9 +497,11 @@ class SmokingDetectionPipeline:
             feats = self.model.extract_feature(batch).cpu()  # (N, C, H', W')
 
             shorts, longs = [], []
-            for i, tid in enumerate(tids):
+            # 只走有 ROI 的對象,且順序與 rois 一致
+            net_tids = sorted(model_rows, key=model_rows.get)
+            for tid in net_tids:
                 st = self._tracks[tid]
-                st.buffer.push(feats[i])
+                st.buffer.push(feats[model_rows[tid]])
                 shorts.append(st.buffer.get_short())
                 longs.append(st.buffer.get_long())
 
@@ -480,9 +514,9 @@ class SmokingDetectionPipeline:
             if not self.skeleton_enabled:
                 # 無骨架時,狀態機/計數器以網路階段頭為階段來源
                 stage_ids = out["stage_logits"].argmax(dim=1).cpu()
-                for i, tid in enumerate(tids):
+                for tid in net_tids:
                     st = self._tracks[tid]
-                    st.last_stage = int(stage_ids[i])
+                    st.last_stage = int(stage_ids[model_rows[tid]])
                     st.state_machine.push(st.last_stage, timestamp)
                     st.counter.update(st.last_stage, timestamp)
 
@@ -494,17 +528,21 @@ class SmokingDetectionPipeline:
         mode = self.method.stage1
         for i, tid in enumerate(tids):
             st = self._tracks[tid]
+            # 這個對象有沒有跑外觀網路(非候選就沒有,列號也不存在)
+            row = model_rows.get(tid)
+            net = (None if net_scores is None or row is None
+                   else float(net_scores[row]))
             if mode == "rule":
-                cyc = st.counter.score()          # 純規則:只看次數警戒
+                cyc = self._rule_score(st)        # 純規則:次數 + 序列加成
             elif mode == "network":
-                if net_scores is None:
+                if net is None:
                     continue
-                cyc = float(net_scores[i])        # 純網路:只看外觀分數
-            elif net_scores is not None:
-                cyc = cycle_score(st.counter.score(), float(net_scores[i]),
+                cyc = net                         # 純網路:只看外觀分數
+            elif net is not None:
+                cyc = cycle_score(self._rule_score(st), net,
                                   w["state_machine"], w["network"])
             elif self.skeleton_enabled:
-                cyc = st.counter.score()  # 純骨架模式(無模型)
+                cyc = self._rule_score(st)  # 純骨架模式(無模型)
             else:
                 continue
 
@@ -521,8 +559,9 @@ class SmokingDetectionPipeline:
             # 否則「純網路」實際上是被規則綁著跑,失去對照的意義
             enough_events = (st.counter.count() >= self.min_events
                              if self.method.count_gate else True)
-            waiting_ok = (not self.smoking_requires_waiting
-                          or st.presence_state == PresenceClassifier.WAITING)
+            # 與「要不要分析」同一份實作:先前兩處各寫一次,結果分析端
+            # 改了、通報端沒改,變成「照樣分析、只是不通報」
+            waiting_ok = self._is_smoking_candidate(st)
             allow = (self.smoking_alarm_enabled
                      and waiting_ok
                      and not is_back
@@ -542,7 +581,12 @@ class SmokingDetectionPipeline:
             # 次數主導:條件全過時分數直接推滿,P 快速進入觸發區,
             # 經 sustain 秒確認後通報(事件過期後 P 自然衰退解除)
             if self.count_driven and allow and self.method.count_gate:
-                cyc = 1.0
+                # 下限而不是覆蓋。原本直接設 1.0,等於把融合結果整個丟掉
+                # ——實測 hybrid 與 rule 的警報時刻只差 0.2 秒,外觀網路對
+                # 紅色警報毫無影響,論文的橫向比較表因此變得沒有意義。
+                # 改成拉到剛好過線:次數主導的原意(次數夠就該通報)保住
+                # 了,而分數更高的方法仍然更早觸發,方法之間分得開
+                cyc = max(cyc, self.count_floor)
             was_active = st.alarm_active
             st.last_P, st.alarm_active = self.alarm.update(
                 tid, cyc, timestamp, frame, allow_trigger=allow)
@@ -556,16 +600,18 @@ class SmokingDetectionPipeline:
                 st.verify = None
                 st.verify_pending = False
                 st.evidence_start_t = None
+                # 疑似時刻也要清:只靠 90 秒視窗修剪的話,同一個人在視窗
+                # 內二次觸發時 min(raises) 會取到上一輪的動作,標記指到
+                # 與這次警報無關的地方(一根菸的節律正好就在 60-90 秒)
+                st.raises.clear()
 
-            st.unverified = (is_back and net_scores is not None
-                             and float(net_scores[i])
-                             >= unv.get("net_score_min", 0.7))
+            st.unverified = (is_back and net is not None
+                             and net >= unv.get("net_score_min", 0.7))
             # hard case 存檔:每 track 有冷卻時間,避免同一情境重複存
             if st.unverified and (timestamp - st.last_hardcase_t
                                   >= unv.get("save_cooldown_sec", 30.0)):
                 st.last_hardcase_t = timestamp
-                self._save_hard_case(tid, float(net_scores[i]),
-                                     timestamp, frame)
+                self._save_hard_case(tid, net, timestamp, frame)
 
         for i, tid in enumerate(tids):
             st = self._tracks[tid]

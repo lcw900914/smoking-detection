@@ -174,6 +174,7 @@ class MarkerAxis(tk.Canvas):
         self.on_seek = on_seek
         self.duration = 0.0
         self.marks = []       # [(時間, 種類)] 種類為 detect / manual
+        self.empty_hint = "(還沒分析)"
         self._hit = []        # [(x, 時間)] 供點擊比對
         self.bind("<Button-1>", self._click)
         self.bind("<Configure>", lambda _e: self.redraw())
@@ -192,8 +193,10 @@ class MarkerAxis(tk.Canvas):
             w = max(self.winfo_width(), 1)
             self.on_seek(max(0.0, min(self.duration, x / w * self.duration)))
 
-    def set_marks(self, marks) -> None:
+    def set_marks(self, marks, hint: str = None) -> None:
         self.marks = sorted(marks, key=lambda m: m[0])
+        if hint is not None:
+            self.empty_hint = hint
         self.redraw()
 
     def redraw(self) -> None:
@@ -203,8 +206,11 @@ class MarkerAxis(tk.Canvas):
         self.create_line(0, y, w, y, fill="#4a4a4a", width=2)
         self._hit = []
         if not self.marks:
+            # 說清楚是「分析過但沒找到」還是「還沒分析」。一支確實觸發過
+            # 警報的片段顯示「沒有標記」時,使用者無從判斷是沒抽菸、分析
+            # 沒跑、還是規則擋掉了——看起來就像偵測壞了
             self.create_text(8, self.H - 12, anchor="w", fill="#777777",
-                             text="(還沒有標記)")
+                             text=self.empty_hint)
             return
         for t, kind in self.marks:
             x = (t / self.duration) * w if self.duration > 0 else 0
@@ -252,6 +258,7 @@ class VideoPlayer(tk.Toplevel):
         # 順便建好——那一趟本來就在跑姿態偵測,不留下來等於白算。
         # 播放時只是查表畫線(約 1ms),不再每幀重跑偵測(約 27ms)。
         self.pose_cache = {}
+        self._analysed = False
         self._pose_stride = 1
         self._frame = None            # 目前這一幀(原始 BGR,截圖用)
         self._photo = None            # 防 GC
@@ -528,6 +535,7 @@ class VideoPlayer(tk.Toplevel):
         self.bar.detected = list(a.alarms)
         self.pose_cache = dict(a.poses)
         self._pose_stride = a.stride
+        self._analysed = True
         self._sync_marks()
         n = len(a.alarms)
         self.status.set(
@@ -538,8 +546,11 @@ class VideoPlayer(tk.Toplevel):
 
     def _sync_marks(self) -> None:
         self.bar.redraw()
-        self.axis.set_marks([(t, "detect") for t in self.bar.detected]
-                            + [(t, "manual") for t in self.bar.manual])
+        self.axis.set_marks(
+            [(t, "detect") for t in self.bar.detected]
+            + [(t, "manual") for t in self.bar.manual],
+            hint=("(已分析,沒有偵測到抽菸)" if getattr(self, "_analysed", False)
+                  else "(還沒分析)"))
 
     # ---------- 標記 ----------
 

@@ -121,7 +121,8 @@ def ensure_day_dirs(site_root: Path,
 
 
 def prune_days(site_root: Path, keep: int = DEFAULT_KEEP_DAYS,
-               dry_run: bool = False) -> List[Path]:
+               dry_run: bool = False,
+               when: Optional[datetime] = None) -> List[Path]:
     """只保留最新的 keep 個日期資料夾,其餘刪除;回傳被刪的清單。
 
     這個函式會**遞迴刪除目錄**,所以每一條限制都是刻意的:
@@ -131,6 +132,8 @@ def prune_days(site_root: Path, keep: int = DEFAULT_KEEP_DAYS,
       筆記、手動整理的資料夾——一律不碰
     - 跳過符號連結(不跟著連結刪到別的地方去)
     - `keep < 1` 直接拒絕:那等於要求清空,不會是有意的
+    - **未來日期的資料夾不算進額度也不刪**:`ensure_day_dirs()` 會預建
+      明天,那個空資料夾若佔掉一格,`keep=3` 實際只留得到 2 天錄影
     """
     if keep < 1:
         raise ValueError(f"keep 至少要 1,收到 {keep}")
@@ -140,7 +143,13 @@ def prune_days(site_root: Path, keep: int = DEFAULT_KEEP_DAYS,
         (d for d in site_root.iterdir()
          if d.is_dir() and not d.is_symlink() and DAY_RE.match(d.name)),
         key=lambda d: d.name)
-    doomed = days[:-keep] if keep < len(days) else []
+    # 未來日期(ensure_day_dirs 預建的明天)不算進額度,也絕不刪。
+    # 不排除的話,那個空資料夾會佔掉一格:keep=3 實際只留得到 2 天錄影
+    today = day_name(when or datetime.now())
+    future = [d for d in days if d.name > today]
+    past = [d for d in days if d.name <= today]
+    doomed = past[:-keep] if keep < len(past) else []
+    del future
     if not dry_run:
         for d in doomed:
             shutil.rmtree(d, ignore_errors=True)

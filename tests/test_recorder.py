@@ -154,11 +154,31 @@ class TestPruneDays:
         site = tmp_path / "youtube_abc"
         base = datetime(2026, 8, 10)
         for i in range(7):                        # 連錄七天
-            ensure_day_dirs(site, base + timedelta(days=i))
-            prune_days(site, keep=3)
+            day = base + timedelta(days=i)
+            ensure_day_dirs(site, day)
+            prune_days(site, keep=3, when=day)
         left = sorted(d.name for d in site.iterdir())
-        # 最後一輪會順便備好「明天」,所以是 3 天 + 預備的那天
-        assert left == ["20260815", "20260816", "20260817"]
+        # 三天**錄影**(0814-0816)+ 預先備好的明天(0817)。
+        # 預建的明天不該佔掉保留額度——先前會,於是 keep=3 實際只留 2 天
+        assert left == ["20260814", "20260815", "20260816", "20260817"]
+
+    def test_prepared_tomorrow_does_not_eat_the_quota(self, tmp_path):
+        """這正是先前的 off-by-one:空的明天佔掉一格,少留一天錄影。"""
+        site = tmp_path / "s"
+        for name in ("20260813", "20260814", "20260815", "20260816"):
+            (site / name).mkdir(parents=True)
+        ensure_day_dirs(site, datetime(2026, 8, 16))     # 建出 0817
+        prune_days(site, keep=3, when=datetime(2026, 8, 16))
+        left = sorted(d.name for d in site.iterdir())
+        assert left == ["20260814", "20260815", "20260816", "20260817"]
+
+    def test_future_folders_are_never_deleted(self, tmp_path):
+        site = tmp_path / "s"
+        for name in ("20260810", "20260816", "20260901"):
+            (site / name).mkdir(parents=True)
+        prune_days(site, keep=1, when=datetime(2026, 8, 16))
+        assert sorted(d.name for d in site.iterdir()) == [
+            "20260816", "20260901"]
 
 
 class TestBuildCommand:

@@ -13,6 +13,43 @@ from typing import Deque, List, Optional, Tuple
 S1, S2, S3, BG = 0, 1, 2, 3
 
 
+def accumulated_path(pts, mean_h: float, dt: float = 0.5,
+                     deadband: float = 0.05) -> float:
+    """以固定時間間隔重取樣後累積位移,單位為身高倍數。
+
+    逐幀直接相加有兩個問題,兩個都會改變語意判定:
+
+    1. **雜訊線性累積**。路徑長把每一幀的抖動原封不動加進去,永遠不會
+       互相抵銷(不是 √n)。實測框中心抖動 σ=5px、框高 200px 時,一個
+       **完全靜止**的人 60 秒可以累積到 3.85 身高——超過徘徊門檻 3.0。
+    2. **隨取樣率漂移**。同一段影片同樣的抖動,target_fps 5→30 時累積
+       路徑從 1.18 變成 7.12,判定從「等待」翻成「徘徊」。target_fps 是
+       效能旋鈕,不該決定一個人算不算在徘徊。
+
+    所以先以 ``dt`` 秒為間隔重取樣(取樣率再高也不會多算),再把小於
+    ``deadband`` 身高的位移視為抖動丟掉(0.5 秒走 0.05 身高 ≈ 每秒 0.1
+    身高,遠低於任何真實走動)。
+    """
+    if len(pts) < 2 or mean_h <= 0:
+        return 0.0
+    path = 0.0
+    t0, x0, y0 = pts[0][0], pts[0][1], pts[0][2]
+
+    def take(x, y):
+        step = ((x - x0) ** 2 + (y - y0) ** 2) ** 0.5 / mean_h
+        return step if step >= deadband else 0.0
+
+    for t, x, y, _h in pts[1:]:
+        if t - t0 < dt:
+            continue
+        path += take(x, y)
+        t0, x0, y0 = t, x, y
+    # 補上最後不足一個 dt 的尾段:不補的話 4 秒的路只算得到 3.5 秒,
+    # 短視窗誤差可達 12%。只多一步的抖動,仍受死區擋著
+    path += take(pts[-1][1], pts[-1][2])
+    return path
+
+
 class StageStateMachine:
     """單一 track 的階段序列檢查器。
 
@@ -143,7 +180,10 @@ class HandToMouthCounter:
                 result = (dwell, False, "太短(扶眼鏡/摸臉)")
             elif self.max_dwell is not None and dwell > self.max_dwell:
                 result = (dwell, False, "太長(講電話)")
-            elif self._s2_last - self._last_event < self.min_gap:
+            elif self._s2_start - self._last_event < self.min_gap:
+                # 用停留的**起點**比,不是結束點:結束點差值含本次停留自身
+                # 的長度(2-5 秒),實際門檻會變成 min_gap − dwell,對典型
+                # 停留是負的,等於沒有門檻——實測手只放下 0.7 秒也照樣連計
                 result = (dwell, False, "與上次事件間隔不足")
             else:
                 self._events.append(self._s2_last)
@@ -196,7 +236,8 @@ class MovementGate:
     本質上是定點或慢移動的。
     """
 
-    def __init__(self, max_heights: float = 3.0, window_sec: float = 10.0):
+    def __init__(self, max_heights: float = 3.0, window_sec: float = 10.0,
+                 path_dt: float = 0.5, path_deadband: float = 0.05):
         """
         Args:
             max_heights: 視窗內累積路徑 ≥ 此倍數×人物身高 → 排除
@@ -204,6 +245,8 @@ class MovementGate:
         """
         self.max_heights = max_heights
         self.window_sec = window_sec
+        self.path_dt = path_dt
+        self.path_deadband = path_deadband
         self._hist: Deque[Tuple[float, float, float, float]] = deque()
         # (t, cx, cy, 框高)
 
@@ -218,12 +261,10 @@ class MovementGate:
         if len(self._hist) < 2:
             return False
 
-        path = 0.0
         pts = list(self._hist)
-        for (_, x0, y0, _), (_, x1_, y1_, _) in zip(pts, pts[1:]):
-            path += ((x1_ - x0) ** 2 + (y1_ - y0) ** 2) ** 0.5
         mean_h = sum(h for _, _, _, h in pts) / len(pts)
-        return path / mean_h >= self.max_heights
+        path = accumulated_path(pts, mean_h, self.path_dt, self.path_deadband)
+        return path >= self.max_heights
 
     def reset(self) -> None:
         self._hist.clear()
@@ -261,7 +302,8 @@ class PresenceClassifier:
 
     def __init__(self, window_sec: float = 60.0, short_stay: float = 8.0,
                  long_stay: float = 20.0, pass_path: float = 1.0,
-                 wander_path: float = 3.0, run_speed: float = 1.5):
+                 wander_path: float = 3.0, run_speed: float = 1.5,
+                 path_dt: float = 0.5, path_deadband: float = 0.05):
         """
         Args:
             window_sec: 軌跡回看視窗秒數(在場時長仍以首次出現起算)
@@ -277,6 +319,8 @@ class PresenceClassifier:
         self.pass_path = pass_path
         self.wander_path = wander_path
         self.run_speed = run_speed
+        self.path_dt = path_dt
+        self.path_deadband = path_deadband
         self._first_ts: Optional[float] = None
         self._hist: Deque[Tuple[float, float, float, float]] = deque()
         # (t, cx, cy, 框高)
@@ -308,15 +352,13 @@ class PresenceClassifier:
         if len(self._hist) < 2:
             return 0.0, 0.0, 0.0
         pts = list(self._hist)
-        path = 0.0
-        for (_, x0, y0, _), (_, x1, y1, _) in zip(pts, pts[1:]):
-            path += ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
         mean_h = sum(h for _, _, _, h in pts) / len(pts)
+        path = accumulated_path(pts, mean_h, self.path_dt, self.path_deadband)
         xs = [p[1] for p in pts]
         ys = [p[2] for p in pts]
         span = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
         dt = max(1e-6, pts[-1][0] - pts[0][0])
-        return path / mean_h, span / mean_h, (path / mean_h) / dt
+        return path, span / mean_h, path / dt
 
     def stats(self):
         """診斷用:(在場秒數, 累積路徑, 位移範圍, 速度)。"""
