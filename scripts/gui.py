@@ -45,6 +45,9 @@ import numpy as np  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
 
 from inference import methods as methods_registry  # noqa: E402
+from inference.downloader import (DEFAULT_OUT_DIR,  # noqa: E402
+                                  VideoDownloader, human_duration,
+                                  human_size)
 from inference.recorder import (DEFAULT_KEEP_DAYS,  # noqa: E402
                                 DEFAULT_ROOT as DEFAULT_REC_ROOT,
                                 DEFAULT_SEGMENT_SEC, StreamRecorder,
@@ -224,6 +227,12 @@ class DemoGUI:
         self.rec_thread: threading.Thread = None
         self.rec_q: "queue.Queue" = queue.Queue()
         self._rec_status_t = 0.0
+        # 影片下載分頁(與錄影分開:影片有結尾,直播沒有)
+        self.downloader = None
+        self.dl_thread: threading.Thread = None
+        self.dl_info = None
+        self.dl_q: "queue.Queue" = queue.Queue()
+        self.dl_prog_q: "queue.Queue" = queue.Queue()
         self._poll_id = None
 
         # 警報片段錄製:滾動保留最近 ~10 秒取樣影格(縮小節省記憶體),
@@ -272,8 +281,10 @@ class DemoGUI:
 
         detect_tab = ttk.Frame(self.tabs)
         record_tab = ttk.Frame(self.tabs)
+        download_tab = ttk.Frame(self.tabs)
         self.tabs.add(detect_tab, text="  即時偵測  ")
         self.tabs.add(record_tab, text="  直播錄影  ")
+        self.tabs.add(download_tab, text="  影片下載  ")
         detect_tab.columnconfigure(0, weight=1)
         detect_tab.rowconfigure(0, weight=1)
 
@@ -472,6 +483,7 @@ class DemoGUI:
             side="left", padx=(8, 0))
 
         self._build_record_tab(record_tab)
+        self._build_download_tab(download_tab)
 
     # ---------- 分頁二:直播錄影 ----------
 
@@ -572,6 +584,169 @@ class DemoGUI:
         self.canvas.coords(self._canvas_item, cw // 2, ch // 2)
         self.canvas.itemconfigure(self._canvas_item, image=photo)
         self.canvas.image = photo
+
+    # ---------- 分頁三:影片下載 ----------
+
+    def _build_download_tab(self, parent):
+        """把 YouTube 等網站的**影片**存成檔案。
+
+        與「直播錄影」分頁的分工只有一件事:來源會不會結束。直播沒有結尾,
+        所以錄影器把「讀不到東西」當成斷線去重連;影片有結尾,那個假設會
+        變成無限重錄同一支,所以下載走這一條、交給 yt-dlp。
+        """
+        f = ttk.Frame(parent, padding=8)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+
+        ttk.Label(f, text="下載影片存檔(供離線標記與訓練)。直播請改用"
+                          "「直播錄影」分頁 —— 直播沒有結尾,下載會一直"
+                          "下到磁碟滿。",
+                  foreground="#444444", wraplength=900, justify="left").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        ttk.Label(f, text="影片網址").grid(row=1, column=0, sticky="w")
+        self.dl_url_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.dl_url_var).grid(
+            row=1, column=1, columnspan=2, sticky="ew", padx=4, pady=2)
+        ttk.Button(f, text="查詢資訊", command=self.probe_download).grid(
+            row=1, column=3, sticky="w")
+
+        ttk.Label(f, text="存放資料夾").grid(row=2, column=0, sticky="w")
+        self.dl_dir_var = tk.StringVar(value=DEFAULT_OUT_DIR)
+        ttk.Entry(f, textvariable=self.dl_dir_var).grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=2)
+        ttk.Button(f, text="瀏覽…", command=self._browse_dl_dir).grid(
+            row=2, column=3, sticky="w")
+
+        opts = ttk.Frame(f)
+        opts.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        ttk.Label(opts, text="畫質上限").pack(side="left")
+        self.dl_height_var = tk.StringVar(value="720")
+        ttk.Combobox(opts, textvariable=self.dl_height_var, width=6,
+                     state="readonly",
+                     values=("360", "480", "720", "1080")).pack(side="left",
+                                                                padx=4)
+        self.dl_audio_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="含音訊",
+                        variable=self.dl_audio_var).pack(side="left", padx=8)
+        ttk.Label(opts, text="(720p 以上要影音合流,已內建 ffmpeg)",
+                  foreground="#777777").pack(side="left")
+
+        self.dl_info_lbl = ttk.Label(f, text="", foreground="#444444",
+                                     wraplength=900, justify="left")
+        self.dl_info_lbl.grid(row=4, column=0, columnspan=4, sticky="w",
+                              pady=(4, 2))
+
+        btns = ttk.Frame(f)
+        btns.grid(row=5, column=0, columnspan=4, sticky="w", pady=6)
+        self.dl_start_btn = ttk.Button(btns, text="▼ 開始下載",
+                                       command=self.start_download)
+        self.dl_start_btn.pack(side="left")
+        self.dl_cancel_btn = ttk.Button(btns, text="✕ 取消",
+                                        command=self.cancel_download,
+                                        state="disabled")
+        self.dl_cancel_btn.pack(side="left", padx=4)
+        ttk.Button(btns, text="開啟資料夾",
+                   command=self._open_dl_folder).pack(side="left", padx=4)
+        self.dl_status_var = tk.StringVar(value="待機")
+        ttk.Label(btns, textvariable=self.dl_status_var).pack(side="left",
+                                                              padx=12)
+
+        self.dl_bar = ttk.Progressbar(f, maximum=1.0)
+        self.dl_bar.grid(row=6, column=0, columnspan=4, sticky="ew", pady=2)
+
+        log_box = ttk.LabelFrame(f, text="下載記錄", padding=4)
+        log_box.grid(row=7, column=0, columnspan=4, sticky="nsew", pady=(6, 0))
+        f.rowconfigure(7, weight=1)
+        self.dl_log = tk.Listbox(log_box, height=10)
+        self.dl_log.pack(fill="both", expand=True)
+
+    def _browse_dl_dir(self):
+        p = filedialog.askdirectory(title="選擇影片存放資料夾")
+        if p:
+            self.dl_dir_var.set(p)
+
+    def _open_dl_folder(self):
+        d = Path(self.dl_dir_var.get().strip() or DEFAULT_OUT_DIR)
+        d.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(d))         # noqa: S606 (Windows 專用)
+
+    def _new_downloader(self) -> "VideoDownloader":
+        return VideoDownloader(
+            self.dl_url_var.get().strip(),
+            out_dir=self.dl_dir_var.get().strip() or DEFAULT_OUT_DIR,
+            max_height=int(self.dl_height_var.get()),
+            audio=bool(self.dl_audio_var.get()),
+            log=self.dl_q.put,
+            on_progress=self.dl_prog_q.put)
+
+    def probe_download(self):
+        """先查清楚再下載:標題對不對、多長、多大、是不是直播。"""
+        if not self.dl_url_var.get().strip():
+            messagebox.showerror("缺少網址", "請先填入影片網址。")
+            return
+        self.dl_status_var.set("查詢中…")
+
+        def work():
+            try:
+                info = self._new_downloader().probe()
+            except Exception as e:
+                self.dl_q.put(f"[錯誤] 查詢失敗:{e}")
+                self.dl_info = None
+                return
+            self.dl_info = info
+            self.dl_q.put(
+                f"[資訊] {info['title']}｜{human_duration(info['duration'])}"
+                f"｜約 {human_size(info['size'])}"
+                + ("｜⚠ 這是直播" if info["is_live"] else ""))
+        threading.Thread(target=work, daemon=True).start()
+
+    def start_download(self):
+        if self.downloader is not None:
+            return
+        if not self.dl_url_var.get().strip():
+            messagebox.showerror("缺少網址", "請先填入影片網址。")
+            return
+        dl = self._new_downloader()
+        self.downloader = dl
+        self.dl_start_btn.config(state="disabled")
+        self.dl_cancel_btn.config(state="normal")
+        self.dl_status_var.set("準備中…")
+        self.dl_bar["value"] = 0.0
+
+        def work():
+            try:
+                info = dl.probe()
+                if info["is_live"]:
+                    # 直播沒有結尾,下載會一直下到磁碟滿。直接擋下來,
+                    # 而不是讓使用者半夜發現磁碟爆了
+                    self.dl_q.put("[錯誤] 這是直播,不能用下載。"
+                                  "請改用「直播錄影」分頁。")
+                    return
+                self.dl_q.put(f"[下載] {info['title']}"
+                              f"({human_duration(info['duration'])},"
+                              f"約 {human_size(info['size'])})")
+                path = dl.run()
+                if path is not None:
+                    self.dl_q.put(f"[完成] {path}")
+            except Exception as e:
+                self.dl_q.put(f"[錯誤] {e}")
+            finally:
+                # 不從工作執行緒碰 UI:tkinter 不是執行緒安全的,
+                # 由 _poll_ui 在主執行緒發現變 None 後復原按鈕
+                self.downloader = None
+        self.dl_thread = threading.Thread(target=work, daemon=True)
+        self.dl_thread.start()
+
+    def cancel_download(self):
+        if self.downloader is not None:
+            self.dl_status_var.set("取消中…")
+            self.downloader.cancel()
+
+    def _reset_dl_buttons(self):
+        self.dl_start_btn.config(state="normal")
+        self.dl_cancel_btn.config(state="disabled")
+        self.dl_status_var.set("待機")
 
     # ---------- 錄影分頁的行為 ----------
 
@@ -967,6 +1142,10 @@ class DemoGUI:
             self.recorder.stop()
             if self.rec_thread is not None:
                 self.rec_thread.join(timeout=8.0)
+        if self.downloader is not None:
+            self.downloader.cancel()
+            if self.dl_thread is not None:
+                self.dl_thread.join(timeout=5.0)
         self.root.after(150, self.root.destroy)
 
     # ---------- UI 更新 ----------

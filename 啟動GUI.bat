@@ -4,10 +4,17 @@ rem
 rem The window has two tabs along the BOTTOM edge, Excel style:
 rem
 rem     [ Live detection ]  detect / track / alarm / second-stage review
-rem     [ Recording ]       save the stream to disk, no decoding, no lost frames
+rem     [ Recording ]       save a LIVE stream to disk, no decoding, no lost frames
+rem     [ Download ]        save a VIDEO to disk via yt-dlp
 rem
-rem Both can run at the same time: recording never decodes, so it uses no GPU
-rem and does not compete with detection for CPU.
+rem All three can run at once: recording and downloading never decode, so they
+rem use no GPU and do not compete with detection for CPU.
+rem
+rem Recording vs Download -- the only difference is whether the source ENDS.
+rem A live stream has no end, so the recorder treats "nothing to read" as a
+rem dropped connection and reconnects. A video does end, and that assumption
+rem turns into re-downloading the same file forever. So: live -> Recording,
+rem video -> Download. The Download tab refuses live URLs on purpose.
 rem
 rem ---- Live detection tab ----
 rem
@@ -65,6 +72,19 @@ rem deleting anything.
 rem
 rem The same thing from the command line:
 rem     python scripts/record_stream.py <url> --root E:/recordings
+rem
+rem ---- Download tab ----
+rem
+rem Paste a URL, hit "query info" to see title / length / size, then download.
+rem Saved as "<title> [<video id>].mp4" -- the id keeps same-titled reuploads
+rem from overwriting each other. Cancellable; resumes after an interruption.
+rem
+rem 720p and above needs audio+video muxing (modern YouTube only ships 360p
+rem pre-muxed; higher is DASH with separate streams). The ffmpeg used for that
+rem is the one bundled with imageio-ffmpeg, so nothing extra to install.
+rem
+rem Downloaded files feed straight back in: pick one as the "source" on the
+rem detection tab.
 rem
 rem NOTE: keep this file ASCII-only. cmd.exe mangles UTF-8 text under the
 rem default codepage, which turns comments and echo output into garbage.

@@ -28,3 +28,6 @@ logs/
 
 # 直播錄影(每天數十 GB)
 recordings/
+
+# 下載的影片
+downloads/
