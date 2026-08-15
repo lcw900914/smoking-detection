@@ -68,6 +68,8 @@ class TrackState:
     wander_notified: bool = False     # 徘徊已通報(每個 track 只報一次)
     wait_notified: bool = False       # 等待已通報(同上)
     wait_gate_logged: bool = False    # 「型態不符」只提示一次
+    last_raise_t: Optional[float] = None    # 最近一次「舉手」的時刻
+    evidence_start_t: Optional[float] = None  # 本輪證據的起點(第一次抬手)
     skeleton: Optional[SkeletonStageEstimator] = None
     loiter: Optional[LoiterDetector] = None
     last_seen: float = 0.0
@@ -102,6 +104,23 @@ class TrackState:
             return 0.0
         return sum(1 for _, o in self.ori_hist if o == "back") \
             / len(self.ori_hist)
+
+
+def mark_evidence(st: "TrackState", had: int, counted: bool,
+                  timestamp: float) -> None:
+    """把證據起點釘在促成第一次計入事件的那次抬手上。
+
+    標記軸與警報訊息都指向這裡,而不是警報成立的時刻。觸發是「累積夠
+    min_events 次、且 P 持續超過門檻」的結論,可能落在動作開始後十幾二十
+    秒——點過去只會看到人站著,要看的東西早就過去了。
+
+    只釘第一次(``had == 0``):後續幾口是同一輪證據,起點不該往後跑。
+    ``last_raise_t`` 為 None 表示這次計入沒有前導的 S1(例如手已經舉著才
+    進畫面),退回用當下時刻,總比沒有標記好。
+    """
+    if counted and had == 0 and st.evidence_start_t is None:
+        raise_t = st.last_raise_t
+        st.evidence_start_t = timestamp if raise_t is None else raise_t
 
 
 class SmokingDetectionPipeline:
@@ -192,6 +211,11 @@ class SmokingDetectionPipeline:
         self.smoking_requires_waiting = bool(
             self.presence_cfg.get("smoking_requires_waiting", True))
         self.on_presence = None   # (track_id, 在場秒數, 累積路徑)
+        # 新警報成立:(track_id, P, 觸發時刻, 影格, 證據起點)
+        # 證據起點 = 等待狀態下、促成第一次計入事件的那一次抬手。
+        # 標記要指向那裡而不是觸發時刻——觸發是「累積夠了」的結論,
+        # 跳過去時動作往往早就結束了。
+        self.on_alarm = None
         self._dwell_override = None  # GUI 即時調整停留窗口用
 
         # 移動排除(可開關):走動中(累積移動 ≥ N 倍身高)不視為抽菸
@@ -391,11 +415,18 @@ class SmokingDetectionPipeline:
                 # 移動排除開啟且移動中:不計手到嘴事件(走動時手部
                 # 擺動易誤判;餵背景讓進行中的停留正常結算)
                 excluded = self.move_gate_enabled and st.moving
+                if stage == 0:          # S1 舉手
+                    st.last_raise_t = timestamp
+                had = st.counter.count()
                 episode = st.counter.update(3 if excluded else stage,
                                             timestamp)
-                if episode is not None and self.on_event is not None:
+                if episode is not None:
                     dwell, counted, reason = episode
-                    self.on_event(tid, dwell, counted, reason)
+                    mark_evidence(st, had, counted, timestamp)
+                    if self.on_event is not None:
+                        self.on_event(tid, dwell, counted, reason)
+                if st.counter.count() == 0:
+                    st.evidence_start_t = None   # 事件過期,證據鏈重來
                 self._track_approach(tid, st, stage, d, timestamp)
                 # 逗留偵測:手腕可見度 + 位移
                 if st.loiter is not None:
@@ -497,9 +528,13 @@ class SmokingDetectionPipeline:
             # 新觸發 → 送第二階段複核(背景執行緒);解除 → 清掉舊結果
             if st.alarm_active and not was_active:
                 self._submit_verify(tid, st, timestamp)
+                if self.on_alarm is not None:
+                    self.on_alarm(tid, st.last_P, timestamp, frame,
+                                  st.evidence_start_t or timestamp)
             elif was_active and not st.alarm_active:
                 st.verify = None
                 st.verify_pending = False
+                st.evidence_start_t = None
 
             st.unverified = (is_back and net_scores is not None
                              and float(net_scores[i])

@@ -19,7 +19,7 @@ CFG = {
                    "window_sec": 90.0},
     "alarm": {"min_events": 2, "trigger_threshold": 0.6,
               "release_threshold": 0.3, "sustain_sec": 2.0,
-              "clip_overlay": False},
+              "clip_overlay": False, "clip_pre_sec": 10.0},
     "skeleton": {"near_ratio": 0.9, "move_ratio": 0.35, "min_scale_px": 24,
                  "rise_margin": 0.5},
     "move_gate": {"enabled": True, "max_heights": 3.0,

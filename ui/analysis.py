@@ -138,7 +138,10 @@ def analyse_video(path: str, method=None,
     pipe = SmokingDetectionPipeline(cfg, model_cfg, ckpt_path=ckpt,
                                     use_model=bool(model_cfg), method=method)
     hits = []
-    pipe.alarm.callback = lambda tid, P, t, fr: hits.append(t)
+    # 標記指向「證據起點」——等待狀態下促成第一次計入事件的那次抬手,
+    # 而不是警報成立的時刻。觸發是累積夠了的結論,可能落在動作結束後
+    # 十幾秒,點過去只會看到人站著。
+    pipe.on_alarm = lambda tid, P, t, fr, ev: hits.append(ev)
 
     cap = cv2.VideoCapture(str(path))
     fps = cap.get(cv2.CAP_PROP_FPS)

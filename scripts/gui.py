@@ -258,7 +258,7 @@ class DemoGUI:
 
         # 警報片段錄製:滾動保留最近 ~10 秒取樣影格(縮小節省記憶體),
         # 警報觸發時連同後續 4 秒寫成 mp4,供記錄點擊回放
-        self.CLIP_PRE_FRAMES = 100     # 約 10 秒 @10fps
+        self.CLIP_PRE_FRAMES = 100     # 約 10 秒 @10fps(開跑時依設定重建)
         self.CLIP_POST_SEC = 4.0
         self.clip_buffer: deque = deque(maxlen=self.CLIP_PRE_FRAMES)
         # 節點滾動緩衝(與 clip_buffer 同步):錄乾淨影像時畫面上沒有
@@ -1043,11 +1043,19 @@ class DemoGUI:
                 ckpt_path=(ckpt or None) if use_model else None,
                 use_model=use_model, method=method)
             self.alarm_q.put(f"[方法] {method.key} — {method.name}")
+            # 依設定重建滾動緩衝:片段前置太短時,標記跳得到證據起點,
+            # 片段卻拍不到動作的開頭
+            pre = float(infer_cfg["alarm"].get("clip_pre_sec", 10.0))
+            n = max(10, round(pre * infer_cfg["sampling"]["target_fps"]))
+            if n != self.CLIP_PRE_FRAMES:
+                self.CLIP_PRE_FRAMES = n
+                self.clip_buffer = deque(self.clip_buffer, maxlen=n)
+                self.pose_buffer = deque(self.pose_buffer, maxlen=n)
             # 警報 callback 導向 GUI 記錄(同時沿用截圖行為)
             from inference.alarm import default_alarm_callback
             snap_dir = infer_cfg["alarm"]["snapshot_dir"]
 
-            def gui_callback(tid, P, t, frame):
+            def gui_callback(tid, P, t, frame, ev_t=None):
                 default_alarm_callback(tid, P, t, frame, snapshot_dir=snap_dir)
                 # 開始錄警報片段:帶入觸發前的緩衝影格,續錄 POST 秒
                 rec = {"tid": tid, "trigger_t": t,
@@ -1057,9 +1065,17 @@ class DemoGUI:
                 self._active_recs.append(rec)
                 # 清單只放片段,細節走診斷框——警報要一眼看得出「有幾件」,
                 # 混進過程訊息就看不出來了
+                # 證據起點 = 促成第一次計入事件的那次抬手。報「動作從幾秒前
+                # 開始」比報觸發時刻有用——複查時要看的是那裡。
+                lead = ""
+                if ev_t is not None:
+                    ago = t - ev_t
+                    lead = f",動作起於 {ago:.0f} 秒前"
+                    if ago > pre:
+                        lead += f";片段前置只有 {pre:.0f} 秒,拍不到開頭"
                 self.alarm_q.put(time.strftime("%H:%M:%S") +
-                                 f"  ⚠ track {tid} 觸發抽菸警報(P={P:.2f})")
-            pipeline.alarm.callback = gui_callback
+                                 f"  ⚠ track {tid} 觸發抽菸警報(P={P:.2f}{lead})")
+            pipeline.on_alarm = gui_callback
             # 事件結算通知:每次手放下顯示停留秒數與是否計入(可觀察校準)
             # 記錄原則:預設只顯示「警報觸發」;
             # 事件計次與未達門檻等過程訊息全部歸入診斷開關
