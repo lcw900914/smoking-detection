@@ -89,3 +89,59 @@ class TestTruthiness:
 class TestStride:
     def test_never_below_one(self):
         assert Analysis(stride=0).stride == 1
+
+
+class TestBatcher:
+    """批次偵測的代理:對應關係錯了,標記會整個偏掉而且畫面上看不出來。"""
+
+    class _FakeDetector:
+        def __init__(self):
+            self.batch_calls = 0
+            self.single_calls = 0
+
+        def detect_batch(self, frames):
+            self.batch_calls += 1
+            return [("box", f) for f in frames]
+
+        def detect(self, frame):
+            self.single_calls += 1
+            return ("single", frame)
+
+    class _FakePipe:
+        def __init__(self, det):
+            self.detector = det
+
+    def _mk(self):
+        from ui.analysis import _Batcher
+        det = self._FakeDetector()
+        pipe = self._FakePipe(det)
+        return _Batcher(pipe, 4), det, pipe
+
+    def test_replaces_the_pipeline_detector(self):
+        b, _det, pipe = self._mk()
+        assert pipe.detector is b
+
+    def test_serves_results_in_the_order_preloaded(self):
+        """一對一、同順序。錯位一格就等於把某一幀的骨架安到別幀身上。"""
+        b, _det, _pipe = self._mk()
+        b.preload(["f0", "f1", "f2", "f3"])
+        assert [b.detect(None) for _ in range(4)] == [
+            ("box", "f0"), ("box", "f1"), ("box", "f2"), ("box", "f3")]
+
+    def test_batches_once_per_preload(self):
+        b, det, _pipe = self._mk()
+        b.preload(["a", "b", "c", "d"])
+        assert det.batch_calls == 1
+
+    def test_falls_back_when_queue_is_empty(self):
+        """預載用完還被呼叫,就照常單張算——寧可慢也不要拿到錯的那一幀。"""
+        b, det, _pipe = self._mk()
+        b.preload(["a"])
+        b.detect(None)
+        assert b.detect("later") == ("single", "later")
+        assert det.single_calls == 1
+
+    def test_empty_preload_does_not_break(self):
+        b, det, _pipe = self._mk()
+        b.preload([])
+        assert b.detect("x") == ("single", "x")

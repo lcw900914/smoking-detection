@@ -19,8 +19,38 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
+# 批次大小。4 是實測的甜蜜點:1 → 28.1ms/幀、4 → 14.7ms/幀,
+# 但 8 → 50.5ms、16 → 58.3ms —— 6GB VRAM 到批次 8 就塞不下了。
+BATCH = 4
+
 CACHE_DIR = ".analysis"
 CACHE_VERSION = 1
+
+
+class _Batcher:
+    """把管線的偵測器換成「先批次算好、再依序取用」的代理。
+
+    管線內部是 `self.detector.detect(frame)` 一幀一呼叫;要批次化又不想
+    改動即時管線的程式,最小侵入的做法就是換掉那個物件。
+
+    **對應關係是這裡最容易錯的地方**:結果必須與送進去的影格同順序、
+    一對一。錯位的話標記會整個偏掉,而且畫面上看不出來——所以取用時
+    檢查是否用完,用完還被叫就直接退回真正的偵測器,不猜。
+    """
+
+    def __init__(self, pipe, batch: int):
+        self.real = pipe.detector
+        self.batch = batch
+        self._queue = []
+        pipe.detector = self
+
+    def preload(self, frames) -> None:
+        self._queue = list(self.real.detect_batch(frames))
+
+    def detect(self, frame):
+        if self._queue:
+            return self._queue.pop(0)
+        return self.real.detect(frame)   # 沒預載到就照常算,寧可慢不要錯
 
 
 def cache_path(video: str) -> Path:
@@ -114,6 +144,32 @@ def analyse_video(path: str, method=None,
     out = Analysis(stride=step, fps=fps)
     i = 0
     started = time.time()
+    # 批次偵測:每次 predict() 有約 28ms 的固定開銷(換小模型、降解析度
+    # 都省不掉),批次 4 攤掉之後每幀約 14.7ms。管線的狀態機必須循序,
+    # 所以只把「偵測」批次化:先算好一批,再依序餵回去。
+    batcher = _Batcher(pipe, BATCH) if pipe.skeleton_enabled else None
+    pending = []          # [(幀號, 影格)] 等著送批次的取樣幀
+
+    def flush():
+        """把累積的取樣幀批次偵測完,再依序走管線。
+
+        依序這件事不能省:狀態機、計數器、警報的 EMA 全都有時序狀態,
+        亂序餵進去結果就不是同一回事了。批次化的只有偵測本身。
+        """
+        if not pending:
+            return
+        batcher.preload([f for _idx, f in pending])
+        for idx, f in pending:
+            res = pipe.step(f, idx / fps)
+            kp = [r["kpts"] for r in res.values()
+                  if r.get("kpts") is not None]
+            if kp:
+                out.poses[idx] = kp
+            if hits:
+                out.alarms.extend(hits)
+                hits.clear()
+        pending.clear()
+
     try:
         while True:
             if cancel is not None and cancel.is_set():
@@ -130,14 +186,19 @@ def analyse_video(path: str, method=None,
             ok, frame = cap.read()
             if not ok:
                 break
-            res = pipe.step(frame, i / fps)
-            kp = [r["kpts"] for r in res.values()
-                  if r.get("kpts") is not None]
-            if kp:
-                out.poses[i] = kp
-            if hits:
-                out.alarms.extend(hits)
-                hits.clear()
+            if batcher is not None:
+                pending.append((i, frame))
+                if len(pending) >= BATCH:
+                    flush()
+            else:
+                res = pipe.step(frame, i / fps)
+                kp = [r["kpts"] for r in res.values()
+                      if r.get("kpts") is not None]
+                if kp:
+                    out.poses[i] = kp
+                if hits:
+                    out.alarms.extend(hits)
+                    hits.clear()
             if on_progress is not None and i % (step * 20) == 0:
                 # 總幀數不一定拿得到(.ts 錄影檔常回報 0),拿不到就回報
                 # None,讓介面顯示「已處理多久」而不是卡在 0%
@@ -145,6 +206,7 @@ def analyse_video(path: str, method=None,
                 on_progress(frac, len(out.alarms), i / fps,
                             time.time() - started)
             i += 1
+        flush()               # 收尾:最後不滿一批的也要處理
     finally:
         cap.release()
         pipe.close()

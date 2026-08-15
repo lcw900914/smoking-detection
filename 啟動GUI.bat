@@ -95,10 +95,10 @@ rem
 rem Opening a video ANALYSES IT FIRST, then plays. One pass over the clip
 rem produces the smoking marks and the skeleton keypoints together.
 rem
-rem That pass costs roughly TWICE the running time of the clip -- the
-rem detector has to walk the whole thing -- so the dialog gives you three
-rem ways out: wait for it, "play now" (analysis keeps running in the
-rem background and marks appear as they are found), or skip it entirely.
+rem That pass costs roughly as long as the clip itself -- the detector has
+rem to walk the whole thing -- so the dialog gives you three ways out: wait
+rem for it, "play now" (analysis keeps running in the background and marks
+rem appear as they are found), or skip it entirely.
 rem The result is cached next to the video under .analysis (the ORIGINAL
 rem FILE IS NEVER TOUCHED), so opening it again is instant, not minutes.
 rem
