@@ -93,10 +93,14 @@ rem
 rem Built for LABELLING, not for watching. No audio on purpose.
 rem
 rem Opening a video ANALYSES IT FIRST, then plays. One pass over the clip
-rem produces the smoking marks and the skeleton keypoints together, so both
-rem are ready before the first frame shows. The result is cached next to the
-rem video under .analysis (the ORIGINAL FILE IS NEVER TOUCHED), so opening
-rem it a second time is instant instead of minutes.
+rem produces the smoking marks and the skeleton keypoints together.
+rem
+rem That pass costs roughly TWICE the running time of the clip -- the
+rem detector has to walk the whole thing -- so the dialog gives you three
+rem ways out: wait for it, "play now" (analysis keeps running in the
+rem background and marks appear as they are found), or skip it entirely.
+rem The result is cached next to the video under .analysis (the ORIGINAL
+rem FILE IS NEVER TOUCHED), so opening it again is instant, not minutes.
 rem
 rem     play/pause, draggable seek bar, clock
 rem     frame step and 0.25x-2x, for checking the raise/hold/lower turns

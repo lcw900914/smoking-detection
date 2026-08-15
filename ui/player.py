@@ -28,7 +28,7 @@ from typing import List, Optional
 import cv2
 from PIL import Image, ImageTk
 
-from ui.analysis import Analysis, analyse_video
+from ui.analysis import Analysis, AnalysisJob, analyse_video
 
 SPEEDS = (0.25, 0.5, 1.0, 1.5, 2.0)
 SEEK_STEP_SEC = 5.0
@@ -77,6 +77,22 @@ def nearest_pose(cache: dict, idx: int, stride: int):
     stride = max(1, stride)
     base = (idx // stride) * stride
     return cache.get(base) or cache.get(base + stride)
+
+
+def progress_text(frac, found: int, done_sec: float, spent: float) -> str:
+    """分析進度的一行字,含剩餘時間估計。
+
+    一定要有 ETA:分析一支長片要好幾分鐘,只給百分比的話使用者分不出
+    「很慢」與「當掉」。總幀數問不到時(.ts 錄影檔常見)改報「已處理到
+    影片的第幾分鐘」——那至少看得出還在動。
+    """
+    found_txt = f"已找到 {found} 處抽菸"
+    if not frac:
+        return (f"分析中… 已處理到影片 {format_time(done_sec)}"
+                f"(耗時 {format_time(spent)}),{found_txt}")
+    eta = (spent / frac - spent) if frac > 0.02 else None
+    tail = f",預計剩 {format_time(eta)}" if eta and eta > 1 else ""
+    return f"分析中… {frac:.0%}{tail},{found_txt}"
 
 
 def frame_delay_ms(fps: float, speed: float) -> int:
@@ -210,7 +226,7 @@ class VideoPlayer(tk.Toplevel):
 
     def __init__(self, master, path: str, title: str = "",
                  method=None, infer_config: str = "configs/inference.yaml",
-                 analysis=None):
+                 analysis=None, job=None):
         super().__init__(master)
         self.path = str(path)
         self.title(title or Path(self.path).name)
@@ -248,6 +264,11 @@ class VideoPlayer(tk.Toplevel):
         self._dropped = 0
 
         self._build()
+        self._job = job
+        if job is not None:
+            # 模型載入要好幾秒,那段期間沒有進度可報。先講一句,
+            # 免得看起來像什麼都沒發生
+            self.status.set("背景分析中…(可以先看,標記會陸續出現)")
         if analysis:
             # 播放之前就分析好了(見 ui/analysis.py):標記與骨架直接就位,
             # 不必等使用者自己去按,也不必邊播邊算
@@ -563,8 +584,7 @@ class VideoPlayer(tk.Toplevel):
             a = analyse_video(
                 self.path, method=self.method,
                 infer_config=self.infer_config,
-                on_progress=lambda frac, n: self._scan_q.put(
-                    ("progress", (frac, n))),
+                on_progress=lambda *a: self._scan_q.put(("progress", a)),
                 cancel=self._scan_cancel)
             if not self._scan_cancel.is_set():
                 a.save(self.path)      # 存側車檔,下次開就不必再跑
@@ -580,8 +600,7 @@ class VideoPlayer(tk.Toplevel):
             while True:
                 kind, payload = self._scan_q.get_nowait()
                 if kind == "progress":
-                    frac, n = payload
-                    self.status.set(f"分析中… {frac:.0%}(已找到 {n} 處)")
+                    self.status.set(progress_text(*payload))
                 elif kind == "result":
                     self.apply_analysis(payload)
                     self.scan_btn.config(text="🔍 重新分析")
@@ -591,7 +610,22 @@ class VideoPlayer(tk.Toplevel):
                     self.status.set(payload)
         except Empty:
             pass
+        self._watch_job()
         self._poll_id = self.after(80, self._poll)
+
+    def _watch_job(self) -> None:
+        """背景分析:跑完就把標記與骨架補上,中途顯示進度。"""
+        job = getattr(self, "_job", None)
+        if job is None:
+            return
+        if job.result is not None:
+            self.apply_analysis(job.result)
+            self._job = None
+        elif job.error:
+            self.status.set(f"背景分析失敗:{job.error}")
+            self._job = None
+        elif job.progress:
+            self.status.set("(背景)" + progress_text(*job.progress))
 
     # ---------- 其他 ----------
 
@@ -629,89 +663,89 @@ class VideoPlayer(tk.Toplevel):
 
 
 class AnalysisDialog(tk.Toplevel):
-    """播放前先跑分析的進度視窗。可取消——分析一支長片要好幾分鐘。"""
+    """播放前的分析進度視窗。
 
-    def __init__(self, master, path: str, method=None,
-                 infer_config: str = "configs/inference.yaml"):
+    三個出口,對應三種心情:等它跑完(標記最完整)、先播放(分析丟到背景,
+    標記邊跑邊出現)、乾脆不要分析。分析大約要影片長度的兩倍時間,所以
+    「先播放」這條路必須存在——不然二十分鐘的片就得乾等十分鐘。
+    """
+
+    def __init__(self, master, job):
         super().__init__(master)
         self.title("分析影片中")
         self.resizable(False, False)
-        self.result = None
-        self.cancelled = False
-        self._cancel = threading.Event()
-        self._q: Queue = Queue()
+        self.job = job
+        self.outcome = "wait"          # wait / background / cancel
 
         frm = ttk.Frame(self, padding=14)
         frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text=Path(path).name, wraplength=420).pack(anchor="w")
-        ttk.Label(frm, text="先跑一次抽菸判定,順便把骨架算好;"
-                            "跑完才開始播放。原始影片不會被改動。",
-                  foreground="#666666", wraplength=420,
+        ttk.Label(frm, text=Path(job.path).name, wraplength=460).pack(
+            anchor="w")
+        ttk.Label(frm, text="先跑一次抽菸判定,順便把骨架算好。"
+                            "原始影片不會被改動,結果會存起來,"
+                            "同一支片下次開就不用再等。",
+                  foreground="#666666", wraplength=460,
                   justify="left").pack(anchor="w", pady=(2, 8))
-        self.bar = ttk.Progressbar(frm, maximum=1.0, length=420)
+        self.bar = ttk.Progressbar(frm, maximum=1.0, length=460)
         self.bar.pack(fill="x")
         self.msg = tk.StringVar(value="準備中…")
-        ttk.Label(frm, textvariable=self.msg).pack(anchor="w", pady=(6, 8))
-        ttk.Button(frm, text="取消", command=self._cancel_now).pack(
-            anchor="e")
+        ttk.Label(frm, textvariable=self.msg, wraplength=460,
+                  justify="left").pack(anchor="w", pady=(6, 10))
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="先播放(分析在背景繼續)",
+                   command=lambda: self._finish("background")).pack(
+            side="left")
+        ttk.Button(btns, text="不分析,直接播放",
+                   command=lambda: self._finish("cancel")).pack(side="left",
+                                                                padx=6)
 
-        self.protocol("WM_DELETE_WINDOW", self._cancel_now)
+        self.protocol("WM_DELETE_WINDOW",
+                      lambda: self._finish("background"))
         self.transient(master)
         self.grab_set()
-        threading.Thread(target=self._work, args=(path, method, infer_config),
-                         daemon=True).start()
         self._poll()
 
-    def _work(self, path, method, infer_config):
-        try:
-            a = analyse_video(
-                path, method=method, infer_config=infer_config,
-                on_progress=lambda f, n: self._q.put(("p", (f, n))),
-                cancel=self._cancel)
-            if not self._cancel.is_set():
-                a.save(path)
-            self._q.put(("done", a))
-        except Exception as e:
-            self._q.put(("err", str(e)))
-
-    def _cancel_now(self):
-        self.cancelled = True
-        self._cancel.set()
-        self.msg.set("取消中…")
+    def _finish(self, outcome: str):
+        self.outcome = outcome
+        if outcome == "cancel":
+            self.job.cancel()
+        self.destroy()
 
     def _poll(self):
-        try:
-            while True:
-                kind, payload = self._q.get_nowait()
-                if kind == "p":
-                    frac, n = payload
-                    self.bar["value"] = frac
-                    self.msg.set(f"分析中… {frac:.0%}(已找到 {n} 處抽菸)")
-                elif kind == "done":
-                    self.result = payload
-                    self.destroy()
-                    return
-                elif kind == "err":
-                    messagebox.showerror("分析失敗", payload, parent=self)
-                    self.destroy()
-                    return
-        except Empty:
-            pass
-        self.after(80, self._poll)
+        if self.job.error:
+            messagebox.showerror("分析失敗", self.job.error, parent=self)
+            self._finish("cancel")
+            return
+        if not self.job.running:
+            self._finish("wait")
+            return
+        if self.job.progress:
+            frac = self.job.progress[0]
+            self.bar["value"] = frac or 0.0
+            self.msg.set(progress_text(*self.job.progress))
+        self.after(120, self._poll)
 
 
 def open_video(master, path: str, title: str = "", method=None,
                infer_config: str = "configs/inference.yaml"):
-    """開一支影片:**先分析、再播放**。
+    """開一支影片:**先分析、再播放**,但不強迫你等完。
 
-    有側車檔就直接載入(分析一支十分鐘的片要好幾分鐘,每次重開都重跑
-    沒人受得了);沒有才跑一次並存起來。使用者取消分析仍然照常播放,
-    只是沒有標記——不該因為不想等就連看都不能看。
+    有側車檔就直接載入(分析要影片長度的兩倍時間,每次重開都重跑沒人
+    受得了);沒有才跑,而且可以選擇丟到背景先看片,標記邊跑邊出現。
     """
     a = Analysis.load(path)
-    if a is None:
-        dlg = AnalysisDialog(master, path, method, infer_config)
-        master.wait_window(dlg)
-        a = dlg.result
+    if a is not None:
+        return VideoPlayer(master, path, title, method=method,
+                           infer_config=infer_config, analysis=a)
+
+    job = AnalysisJob(path, method, infer_config)
+    dlg = AnalysisDialog(master, job)
+    master.wait_window(dlg)
+    if dlg.outcome == "wait":
+        return VideoPlayer(master, path, title, method=method,
+                           infer_config=infer_config, analysis=job.result)
+    # 先播放:分析還在跑,播放器自己盯著它,好了就把標記補上
     return VideoPlayer(master, path, title, method=method,
-                       infer_config=infer_config, analysis=a)
+                       infer_config=infer_config,
+                       job=job if dlg.outcome == "background" else None)
