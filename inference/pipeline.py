@@ -37,6 +37,8 @@ from inference.state_machine import (StageStateMachine, cycle_score,
 from inference.skeleton import (SkeletonStageEstimator, draw_skeleton,
                                 L_WRI, R_WRI)
 from inference.alarm import AlarmManager
+from inference import methods as methods_registry
+from inference import verifier as verify_mod
 from utils import load_config, resolve_device
 
 # ImageNet 正規化(與訓練一致)
@@ -81,6 +83,12 @@ class TrackState:
     last_kpts: Optional[np.ndarray] = None
     last_dnorm: Optional[float] = None
     ori_hist: deque = field(default_factory=deque)  # (t, orientation)
+    # 節點滾動緩衝(t, kpts):第二階段複核的輸入來源。
+    # 17×3 float @10fps 每人每分鐘約 120 KB,成本近零,所以恆常累積,
+    # 不管當下有沒有要複核 —— 警報觸發時證據已經在過去,來不及回頭錄
+    pose_hist: deque = field(default_factory=deque)
+    verify: Optional["verify_mod.VerifyResult"] = None
+    verify_pending: bool = False
 
     def back_fraction(self, now: float, window: float) -> float:
         """近期視窗內判定為背向的幀比例。"""
@@ -96,9 +104,24 @@ class SmokingDetectionPipeline:
     """多人抽菸行為偵測管線。"""
 
     def __init__(self, infer_cfg: dict, model_cfg: Optional[dict] = None,
-                 ckpt_path: Optional[str] = None, use_model: bool = True):
+                 ckpt_path: Optional[str] = None, use_model: bool = True,
+                 method=None):
+        # 判定方法(見 inference/methods.py):決定 stage1 怎麼算分、
+        # 要不要開骨架分支、要不要載外觀網路、以及有沒有第二階段複核。
+        # 沒指定時由 use_model 反推,舊呼叫端的行為完全不變。
+        if method is None:
+            method = methods_registry.get("hybrid" if use_model else "rule")
+        elif isinstance(method, str):
+            method = methods_registry.get(method)
+        self.method = method
+        if method.needs_appearance and model_cfg is None:
+            raise ValueError(
+                f"方法「{method.name}」需要外觀網路,請提供 model_cfg")
+        # 方法自己決定骨架分支的開關,不受設定檔挑錯影響
+        infer_cfg = method.apply(infer_cfg)
         self.cfg = infer_cfg
-        self.use_model = use_model and model_cfg is not None
+        self.use_model = (method.needs_appearance and use_model
+                          and model_cfg is not None)
 
         det = infer_cfg["detector"]
         self.device = resolve_device(det.get("device", "auto"))
@@ -166,6 +189,22 @@ class SmokingDetectionPipeline:
             sustain_sec=al["sustain_sec"],
             snapshot_dir=al["snapshot_dir"])
 
+        # 第二階段複核(方法不含 stage2 時為 None)。
+        # 複核在背景執行緒跑:它是離線工作,不該讓即時路徑等它。
+        vcfg = infer_cfg.get("verify", {})
+        self.verifier = verify_mod.build(method, infer_cfg)
+        self.verify_window_sec = float(vcfg.get("window_sec", 90.0))
+        self.on_verify = None      # (track_id, VerifyResult)
+        self._verify_pool = None
+        if self.verifier is not None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._verify_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="verify")
+        target_fps = float(self.cfg["sampling"]["target_fps"])
+        # 緩衝格數留 1.2 倍餘裕:來源 fps 抖動時不會把窗頭吃掉
+        self._pose_maxlen = max(16, int(self.verify_window_sec
+                                        * target_fps * 1.2))
+
         self.recycle_sec = infer_cfg["track_recycle_sec"]
         self._tracks: Dict[int, TrackState] = {}
 
@@ -218,6 +257,7 @@ class SmokingDetectionPipeline:
                     pass_path=pr.get("pass_path", 1.0),
                     wander_path=pr.get("wander_path", 3.0),
                     run_speed=pr.get("run_speed", 1.5)),
+                pose_hist=deque(maxlen=self._pose_maxlen),
                 counter=HandToMouthCounter(
                     window_sec=esc.get("window_sec", 90.0),
                     min_dwell=(self._dwell_override[0] if self._dwell_override
@@ -262,6 +302,10 @@ class SmokingDetectionPipeline:
             if all_kpts is not None:
                 k = _best_iou(bbox, dets[:, :4])
                 st.last_kpts = all_kpts[k] if k is not None else None
+                # 節點進滾動緩衝(複製一份:偵測器可能重用同一塊記憶體)
+                st.pose_hist.append(
+                    (timestamp, None if st.last_kpts is None else
+                     np.asarray(st.last_kpts, np.float32).copy()))
             smoothed = self.smoother.update(tid, bbox)
             # 移動量恆常累計(排除與否由開關決定,開關切換即時反映)
             if st.move_gate is not None:
@@ -350,9 +394,16 @@ class SmokingDetectionPipeline:
         # 網路分數若仍偏高,分流為橘色「無法確認」警示 + hard case 存檔
         w = self.sm_cfg["weights"]
         unv = self.cfg.get("unverified", {})
+        mode = self.method.stage1
         for i, tid in enumerate(tids):
             st = self._tracks[tid]
-            if net_scores is not None:
+            if mode == "rule":
+                cyc = st.counter.score()          # 純規則:只看次數警戒
+            elif mode == "network":
+                if net_scores is None:
+                    continue
+                cyc = float(net_scores[i])        # 純網路:只看外觀分數
+            elif net_scores is not None:
                 cyc = cycle_score(st.counter.score(), float(net_scores[i]),
                                   w["state_machine"], w["network"])
             elif self.skeleton_enabled:
@@ -369,16 +420,27 @@ class SmokingDetectionPipeline:
                         > st.counter.max_dwell)
             # 紅色警報條件:非背向、非移動中(若開啟排除)、
             # 非講電話姿態、事件次數達門檻、P 持續超過觸發線
+            # count_gate=False 的方法(純外觀網路基準線)不套次數規則,
+            # 否則「純網路」實際上是被規則綁著跑,失去對照的意義
+            enough_events = (st.counter.count() >= self.min_events
+                             if self.method.count_gate else True)
             allow = (not is_back
                      and not (self.move_gate_enabled and st.moving)
                      and not st.phone
-                     and st.counter.count() >= self.min_events)
+                     and enough_events)
             # 次數主導:條件全過時分數直接推滿,P 快速進入觸發區,
             # 經 sustain 秒確認後通報(事件過期後 P 自然衰退解除)
-            if self.count_driven and allow:
+            if self.count_driven and allow and self.method.count_gate:
                 cyc = 1.0
+            was_active = st.alarm_active
             st.last_P, st.alarm_active = self.alarm.update(
                 tid, cyc, timestamp, frame, allow_trigger=allow)
+            # 新觸發 → 送第二階段複核(背景執行緒);解除 → 清掉舊結果
+            if st.alarm_active and not was_active:
+                self._submit_verify(tid, st, timestamp)
+            elif was_active and not st.alarm_active:
+                st.verify = None
+                st.verify_pending = False
 
             st.unverified = (is_back and net_scores is not None
                              and float(net_scores[i])
@@ -409,10 +471,55 @@ class SmokingDetectionPipeline:
                 "unverified": st.unverified,
                 "moving": self.move_gate_enabled and st.moving,
                 "phone": st.phone,
+                # 第二階段複核:complete 前為 pending,無 stage2 的方法為 None
+                "verify": ("pending" if st.verify_pending else
+                           st.verify.status if st.verify else None),
+                "verify_top": st.verify.top if st.verify else None,
+                "verify_smoking": st.verify.smoking if st.verify else None,
             }
 
         self._recycle_stale(timestamp)
         return results
+
+    # ---------- 第二階段複核 ----------
+
+    def _submit_verify(self, tid: int, st: TrackState,
+                       timestamp: float) -> None:
+        """把這個 track 的節點滾動窗丟給複核器(背景執行緒)。
+
+        取的是**觸發時刻往前**的窗,不等後續影格:紅色警報要 ≥3 次手到嘴
+        事件加 sustain 秒才成立,證據早就落在過去了。等未來幾秒只會延後
+        結果,換不到新資訊。
+        """
+        if self.verifier is None or self._verify_pool is None:
+            return
+        kpts, span = verify_mod.pose_window(
+            list(st.pose_hist), timestamp, self.verify_window_sec,
+            float(self.cfg["sampling"]["target_fps"]))
+        st.verify_pending = True
+        st.verify = None
+        fps = float(self.cfg["sampling"]["target_fps"])
+
+        def work():
+            try:
+                res = self.verifier.verify(kpts, fps, span_sec=span)
+            except Exception as e:      # 複核失敗絕不可影響第一階段警報
+                res = verify_mod.VerifyResult(
+                    status=verify_mod.ABSTAIN, span_sec=span,
+                    reason=f"複核發生錯誤:{e}")
+            st.verify = res
+            st.verify_pending = False
+            if self.on_verify is not None:
+                self.on_verify(tid, res)
+
+        self._verify_pool.submit(work)
+
+    def close(self) -> None:
+        """釋放背景資源。GUI 每次「開始」都會建一條新管線,不收的話
+        每停一次就留下一個閒置的複核執行緒。"""
+        if self._verify_pool is not None:
+            self._verify_pool.shutdown(wait=False)
+            self._verify_pool = None
 
     def _track_approach(self, tid: int, st: TrackState, stage: int,
                         d: Optional[float], timestamp: float) -> None:
@@ -475,9 +582,12 @@ class SmokingDetectionPipeline:
         (RTSP 憑證特殊字元自動編碼、TCP 傳輸、斷線自動重連)。
         """
         from inference.stream import VideoSource
-        vs = VideoSource(source, **self.cfg.get("stream", {}))
-
         target_fps = self.cfg["sampling"]["target_fps"]
+        # 告訴來源我們實際要幾 fps:HLS 的佇列會在收幀時就抽稀到這個
+        # 量級,不然整段 30 fps 全存進記憶體
+        vs = VideoSource(source, sample_fps=target_fps,
+                         **self.cfg.get("stream", {}))
+
         sample_every = max(1, round(vs.fps / target_fps))  # 檔案:幀計數取樣
         min_interval = 1.0 / target_fps                     # live:時間取樣
         print(f"[管線] 來源={vs.kind} fps={vs.fps:.1f},"
@@ -497,7 +607,9 @@ class SmokingDetectionPipeline:
                         continue  # 讀取逾時(重連中),持續等待
                     break         # 檔案播畢
 
-                if vs.is_live:
+                if getattr(vs, "pre_sampled", False):
+                    do_step = True      # 來源已抽稀到 target_fps,不再濾
+                elif vs.is_live:
                     do_step = ts - last_proc >= min_interval
                 else:
                     do_step = frame_idx % sample_every == 0
@@ -520,6 +632,7 @@ class SmokingDetectionPipeline:
                 frame_idx += 1
         finally:
             vs.release()
+            self.close()
             if writer is not None:
                 writer.release()
                 print(f"[管線] 影片已存:{save_video}")
@@ -575,9 +688,13 @@ def draw_overlay(frame: np.ndarray, results: Dict[int, dict]) -> np.ndarray:
                           d_norm=r.get("d_norm"))
         x1, y1, x2, y2 = [int(v) for v in r["bbox"]]
         level = r.get("level", 0.0)
-        if r["alarm"]:
+        # 降級不否決:第二階段判「非抽菸」時警報**仍在**,只是由紅轉橘
+        # 待人工複查;複核中或棄權一律維持紅色
+        downgraded = r["alarm"] and r.get("verify") == "review"
+        if r["alarm"] and not downgraded:
             color = (0, 0, 255)          # 紅:警報
-        elif r.get("unverified") or r.get("loiter") or r.get("wander_alert"):
+        elif downgraded or r.get("unverified") or r.get("loiter") \
+                or r.get("wander_alert"):
             color = (0, 165, 255)        # 橘:無法確認 / 逗留 / 徘徊警示
         elif level >= 0.5:
             color = (0, 200, 255)        # 黃:中警戒
@@ -607,6 +724,10 @@ def draw_overlay(frame: np.ndarray, results: Dict[int, dict]) -> np.ndarray:
             label += " PHONE"
         if r["alarm"]:
             label += " SMOKING!"
+        v = r.get("verify")
+        if r["alarm"] and v:
+            label += {"pending": " VERIFYING", "confirmed": " CONFIRMED",
+                      "review": " REVIEW", "abstain": " NO-SKEL"}.get(v, "")
         cv2.putText(vis, label, (x1, max(0, y1 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         # P_t 置信度條(框左側豎條)
@@ -627,15 +748,35 @@ def main():
     parser.add_argument("--model-ckpt", default=None, help="模型權重路徑")
     parser.add_argument("--no-model", action="store_true",
                         help="只跑偵測+追蹤(M1 骨架驗證)")
+    parser.add_argument(
+        "--method", default=methods_registry.DEFAULT_KEY,
+        choices=methods_registry.keys() + ["list"],
+        help="判定方法(見 inference/methods.py);list = 只列出可選項目")
     parser.add_argument("--save-video", default=None, help="輸出 mp4 路徑")
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
 
+    if args.method == "list":
+        for m in methods_registry.METHODS:
+            mark = "" if m.available else f"  [缺 {', '.join(m.missing())}]"
+            print(f"{m.key:18} {m.name}{mark}\n{'':18} {m.desc}")
+        return
+
+    method = methods_registry.get(args.method)
+    if method.missing():
+        parser.error(f"方法「{method.name}」缺少權重:"
+                     f"{', '.join(method.missing())}")
+    if args.no_model and method.needs_appearance:
+        parser.error(f"--no-model 與方法「{method.name}」衝突,"
+                     f"要不用外觀網路請改 --method rule")
     infer_cfg = load_config(args.infer_config)
-    model_cfg = None if args.no_model else load_config(args.model_config)
+    # 要不要載外觀網路由方法決定,不再由旗標決定
+    model_cfg = (load_config(args.model_config)
+                 if method.needs_appearance else None)
     pipeline = SmokingDetectionPipeline(
         infer_cfg, model_cfg, ckpt_path=args.model_ckpt,
-        use_model=not args.no_model)
+        use_model=method.needs_appearance, method=method)
+    print(f"[管線] 判定方法:{pipeline.method.key} — {pipeline.method.name}")
     pipeline.run(args.source, display=not args.no_display,
                  save_video=args.save_video)
 

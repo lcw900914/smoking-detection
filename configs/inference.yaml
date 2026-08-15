@@ -12,10 +12,22 @@ tracker:                  # ByteTrack(supervision 實作)
 sampling:
   target_fps: 10          # 特徵取樣率(8-10 fps),依來源 fps 自動決定每 N 幀取樣
 
-stream:                   # RTSP / 攝影機串流(inference/stream.py)
+stream:                   # RTSP / YouTube / HTTP 串流(inference/stream.py)
   use_tcp: true
   connect_timeout_sec: 5.0
   reconnect_sec: 3.0
+  max_height: 720         # YouTube 解析時偏好的最大畫面高度。
+                          # ⚠ 調低**不會**變快:YOLO 內部一律縮到 imgsz=640,
+                          # 實測 720p 與 480p 的 detect 都是 27ms,只差解碼
+                          # 那 2ms。480p 反而因串流本身的分段節奏更慢。
+                          # 這個值影響的是畫質與網路量,不是速度
+  buffer_sec: 3.0         # HLS 佇列保留幾秒(滿了丟最舊的)
+  prefill_sec: 5.0        # 開始供幀前先囤幾秒(= 刻意落後直播邊緣這麼多)。
+                          # HLS 一段送完就空等,貼著直播邊緣跑會一頓一頓;
+                          # 先囤起來讓存量吸收顛簸。代價是多這麼多延遲。
+                          # ⚠ 只有在收幀跟得上即時時有效 —— 管線啟動時會印
+                          # lag_ratio,<1 表示正被直播拉開,囤再多只是把
+                          # 卡頓延後,要從別處省 CPU
 
 escalation:               # 次數警戒等級(1 次低 / 2 次中 / ≥3 次高)
   window_sec: 90
@@ -55,6 +67,15 @@ presence:                 # 在場型態:經過 / 徘徊 / 等待(純軌跡幾�
   run_speed: 1.5          # 平均速度超過此值(身高/秒)→ 記為跑步
   alert_wandering: false  # 徘徊時通報(GUI 可開關)。橘色警示,不是紅色
                           # 抽菸警報,也不影響 P_t —— 兩者語意不同
+
+verify:                   # 第二階段複核(只有含 stage2 的方法會用到)
+                          # 見 inference/verifier.py:降級不否決,判「非抽菸」
+                          # 只把紅色警報降為橘色待複查,絕不取消
+  window_sec: 90.0        # 往回取多長的節點序列複核(一根菸的節律需要 60-90 秒)
+  min_smoking: 0.25       # 抽菸分數 ≥ 此值就維持紅色(降級門檻刻意比升級嚴)
+  min_valid_ratio: 0.15   # 骨架有效幀比例低於此值 → 棄權,不做判定
+  min_span_sec: 3.0       # 序列短於此秒數 → 棄權(放不進任何節律)
+  device: auto
 
 unverified:               # 背向 + 網路分數高 → 橘色「無法確認」警示
   back_frac: 0.6

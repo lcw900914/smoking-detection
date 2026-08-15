@@ -27,7 +27,7 @@ FPS = 10.0
 
 def make_reach_sequence(T=120, cx=300.0, cy=200.0, scale=1.0, conf=0.9,
                         rest_frames=30, rise_frames=8, hold_frames=30,
-                        fall_frames=8, rot_deg=0.0):
+                        fall_frames=8, rot_deg=0.0, target=(12.0, -26.0)):
     """合成「手垂著 → 舉到臉 → 停留 → 放下 → 垂著」的序列。
 
     版面(未旋轉、未縮放時,單位為像素):
@@ -50,7 +50,10 @@ def make_reach_sequence(T=120, cx=300.0, cy=200.0, scale=1.0, conf=0.9,
         seq[:, j, 1] = dy
 
     start = np.array([60.0, 60.0])
-    target = np.array([12.0, -26.0])           # 鼻子右下方一點點
+    # 預設落點在鼻子右下方一點點,也就是**右耳旁邊**(耳在 (14,-30))——
+    # 對「手有沒有到臉」的測試足夠,但片段文法會正確地把它讀成講電話。
+    # 要測「手到嘴」的語意請傳 target=(0, -20)(鼻下方,離兩耳都遠)
+    target = np.asarray(target, np.float64)
     t_rise, t_hold, t_fall = (rest_frames, rest_frames + rise_frames,
                               rest_frames + rise_frames + hold_frames)
     for t in range(T):

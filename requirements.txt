@@ -10,6 +10,11 @@ tqdm
 ultralytics>=8.0        # YOLOv8 人物偵測 / pose
 supervision>=0.16,<0.30 # ByteTrack 實作(0.30 起移除,屆時改用 trackers 套件)
 
+# 影像來源
+yt-dlp                  # 把 YouTube 頁面網址解析成 OpenCV 讀得動的串流網址。
+                        # 只有用 YouTube 當來源時才需要;沒裝也不影響其他來源
+                        # (檔案 / 攝影機 / rtsp:// / 直接的 m3u8 網址)
+
 # 訓練
 tensorboard
 scikit-learn            # 評估指標(F1、混淆矩陣)
