@@ -15,6 +15,7 @@
 無音訊下也單純得多(有音訊就得處理音畫同步)。
 """
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from queue import Empty, Queue
@@ -155,6 +156,8 @@ class VideoPlayer(tk.Toplevel):
         self._scan_thread = None
         self._scan_cancel = threading.Event()
         self._scan_q: Queue = Queue()
+        self._next_at = time.perf_counter()   # 下一幀該出現的時刻
+        self._last_bar_draw = 0.0
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -261,6 +264,7 @@ class VideoPlayer(tk.Toplevel):
         self.playing = not self.playing
         self.play_btn.config(text="⏸" if self.playing else "▶")
         if self.playing:
+            self._next_at = time.perf_counter()   # 重新對時,不補舊的幀
             self._tick()
 
     def _set_speed(self):
@@ -268,6 +272,7 @@ class VideoPlayer(tk.Toplevel):
             self.speed = float(self.speed_var.get())
         except ValueError:
             self.speed = 1.0
+        self._next_at = time.perf_counter()
 
     def step(self, delta: int):
         """逐幀。先暫停——逐幀的用途就是停下來細看。"""
@@ -275,7 +280,7 @@ class VideoPlayer(tk.Toplevel):
         self.play_btn.config(text="▶")
         idx = self.cap.get(cv2.CAP_PROP_POS_FRAMES) + delta - 1
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, idx))
-        self._show_next()
+        self._show_next(force_bar=True)
 
     def seek_by(self, seconds: float):
         self.seek_to(self.position + seconds)
@@ -283,18 +288,26 @@ class VideoPlayer(tk.Toplevel):
     def seek_to(self, seconds: float):
         seconds = max(0.0, min(seconds, max(self.duration - 0.05, 0.0)))
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(seconds * self.fps))
-        self._show_next()
+        self._next_at = time.perf_counter()
+        self._show_next(force_bar=True)
 
-    def _show_next(self) -> bool:
+    def _show_next(self, force_bar: bool = False) -> bool:
         ok, frame = self.cap.read()
         if not ok:
             return False
         self._frame = frame
         self._render(frame)
-        self.bar.position = self.position
-        self.bar.redraw()
-        self.time_lbl.config(
-            text=f"{format_time(self.position)} / {format_time(self.duration)}")
+        # 進度條與時間只更新到約 10 Hz。redraw() 會 delete("all") 再重畫
+        # 所有標記,每幀都做在大視窗下就吃掉可觀的時間,而人眼根本看不出
+        # 進度條每秒動 30 次跟動 10 次的差別。
+        pos = self.position
+        now = time.perf_counter()
+        if force_bar or now - self._last_bar_draw >= 0.1:
+            self._last_bar_draw = now
+            self.bar.position = pos
+            self.bar.redraw()
+            self.time_lbl.config(
+                text=f"{format_time(pos)} / {format_time(self.duration)}")
         return True
 
     def _tick(self):
@@ -303,14 +316,24 @@ class VideoPlayer(tk.Toplevel):
         if not self._show_next():
             if self.loop.get():
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                if not self._show_next():
+                if not self._show_next(force_bar=True):
                     self.close()
                     return
             else:
                 self.playing = False
                 self.play_btn.config(text="▶")
                 return
-        self.after(frame_delay_ms(self.fps, self.speed), self._tick)
+        # 解碼與繪圖的時間要從等待裡扣掉,否則週期會變成
+        # 「工作時間 + 名目延遲」,播放永遠比實際慢,而且視窗越大越慢
+        # (實測 640×480 只有 0.80x、1280×800 剩 0.68x)。
+        period = frame_delay_ms(self.fps, self.speed) / 1000.0
+        now = time.perf_counter()
+        self._next_at += period
+        if self._next_at < now - period:
+            # 落後超過一整個週期(視窗很大、或開了骨架疊加)就重新對時。
+            # 不重對的話會一直用 1ms 排程狂追,追不上還把 CPU 吃滿。
+            self._next_at = now + period
+        self.after(max(1, int((self._next_at - now) * 1000)), self._tick)
 
     def redraw_current(self):
         """用目前這一幀重畫(不前進)。視窗縮放與切換骨架疊加時用。"""
@@ -353,8 +376,10 @@ class VideoPlayer(tk.Toplevel):
         threading.Thread(target=work, daemon=True).start()
 
     def _draw_pose(self, frame):
-        """疊加骨架。**每一幀都要重跑偵測(約 27ms)**,所以開著會比較慢
-        —— 這是刻意的取捨:要看清楚系統看到什麼,就得付這個代價。"""
+        """疊加骨架。**每一幀都要重跑偵測(約 27ms)**,所以開著會比較慢:
+        1280×800 實測 1.0x 只跑得到 0.84x(0.5x 以下不受影響,因為那時
+        每幀的預算本來就夠)。這是刻意的取捨——要看清楚系統看到什麼,
+        就得付這個代價;不看的時候關掉即可。"""
         from inference.skeleton import draw_skeleton
         vis = frame.copy()
         try:

@@ -101,6 +101,11 @@ rem Keys: space, left/right = 5s, comma/period = one frame, N/P = next or
 rem previous mark, S = snapshot, M = mark, F = fullscreen, Esc = leave.
 rem The scan uses whichever method the detection tab has selected.
 rem
+rem Playback runs at true 1x: the decode+draw time is subtracted from the
+rem frame wait. Turning the skeleton overlay ON re-runs detection on every
+rem frame (~27ms), so 1x drops to about 0.84x at a large window size --
+rem expected, not a fault. Slower speeds are unaffected.
+rem
 rem Downloaded files feed straight back in: pick one as the "source" on the
 rem detection tab.
 rem
