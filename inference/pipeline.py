@@ -41,6 +41,8 @@ from inference import methods as methods_registry
 from inference import verifier as verify_mod
 from utils import load_config, resolve_device
 
+BG_STAGE = 3   # 背景(與 state_machine 的階段編號約定一致)
+
 # ImageNet 正規化(與訓練一致)
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -284,6 +286,21 @@ class SmokingDetectionPipeline:
                 skeleton=skeleton, loiter=loiter)
         return self._tracks[tid]
 
+    def _is_smoking_candidate(self, st: "TrackState") -> bool:
+        """這個對象現在值不值得跑抽菸分析。
+
+        `smoking_requires_waiting` 開啟時,只有「等待」的人是候選——其餘的
+        人連分析都不做,而不是分析完才在最後一關擋掉。差別在成本:每個
+        對象的 ROI 裁切、外觀網路前向、狀態機與計數器都省下來了。
+
+        注意省不掉的部分:姿態偵測是**整張影格一次**,與對象數量無關,
+        而且不先偵測就不知道誰在等待。所以純規則方法省下的有限(規則本身
+        只佔單步的 7%),外觀網路的方法才省得多(每個對象一次 backbone)。
+        """
+        if not self.smoking_requires_waiting:
+            return True
+        return st.presence_state == PresenceClassifier.WAITING
+
     def _recycle_stale(self, now: float) -> None:
         """回收消失超過 recycle_sec 的 track(buffer、狀態機、警報、平滑器)。"""
         stale = [tid for tid, st in self._tracks.items()
@@ -309,6 +326,7 @@ class SmokingDetectionPipeline:
 
         results: Dict[int, dict] = {}
         rois, tids, boxes = [], [], []
+        model_tids = []          # 真的要跑外觀網路的對象(候選才進來)
         for tid, bbox in tracked:
             st = self._get_track_state(tid)
             st.last_seen = timestamp
@@ -317,9 +335,10 @@ class SmokingDetectionPipeline:
                 k = _best_iou(bbox, dets[:, :4])
                 st.last_kpts = all_kpts[k] if k is not None else None
                 # 節點進滾動緩衝(複製一份:偵測器可能重用同一塊記憶體)
-                st.pose_hist.append(
-                    (timestamp, None if st.last_kpts is None else
-                     np.asarray(st.last_kpts, np.float32).copy()))
+                if self._is_smoking_candidate(st):
+                    st.pose_hist.append(
+                        (timestamp, None if st.last_kpts is None else
+                         np.asarray(st.last_kpts, np.float32).copy()))
             smoothed = self.smoother.update(tid, bbox)
             # 移動量恆常累計(排除與否由開關決定,開關切換即時反映)
             if st.move_gate is not None:
@@ -344,7 +363,8 @@ class SmokingDetectionPipeline:
                             self.on_presence(tid, stay, path, kind)
             boxes.append(smoothed)
             tids.append(tid)
-            if self.use_model:
+            if self.use_model and self._is_smoking_candidate(st):
+                model_tids.append(tid)
                 roi = crop_upper_body(
                     frame, smoothed,
                     aspect_ratio=self.roi_cfg["aspect_ratio"],
@@ -357,6 +377,12 @@ class SmokingDetectionPipeline:
         if self.skeleton_enabled:
             for i, tid in enumerate(tids):
                 st = self._tracks[tid]
+                if not self._is_smoking_candidate(st):
+                    # 非候選:不跑階段判定、不推狀態機、不累積次數。
+                    # 階段歸背景,畫面上就不會顯示 S1/S2/S3
+                    st.last_stage = BG_STAGE
+                    st.last_dnorm = None
+                    continue
                 stage, d, ori = st.skeleton.update(st.last_kpts)
                 st.last_stage = stage
                 st.last_dnorm = d

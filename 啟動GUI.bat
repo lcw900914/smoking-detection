@@ -22,8 +22,13 @@ rem The main screen carries only four switches -- smoking alarm, wandering
 rem alarm, waiting alarm, skeleton overlay. Every threshold lives in the
 rem method's parameter sheet instead.
 rem
-rem WORTH KNOWING: smoking is only ever flagged for people in the WAITING
-rem state -- passing and wandering never raise a smoking alarm. Smoking is
+rem WORTH KNOWING: smoking analysis only RUNS for people in the WAITING
+rem state. Everyone else is skipped outright -- no ROI crop, no appearance
+rem network, no state machine -- rather than analysed and then vetoed, so it
+rem costs less too (hybrid measured 43.3ms -> 19.6ms per step). Note the pose
+rem model still runs once per frame regardless: you cannot know who is
+rem waiting without detecting people first, so the pure-rule method saves
+rem little. Passing and wandering never raise a smoking alarm. Smoking is
 rem something you stop to do, and a walker's arm swing looks like a drag.
 rem Waiting needs the person on screen for long_stay seconds (20 by
 rem default); before that the state reads "judging" and stays silent too.
