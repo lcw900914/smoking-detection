@@ -1,8 +1,21 @@
 """抽菸行為偵測 Demo GUI(Tkinter,無額外相依)。
 
+**所有判定方法共用這一支 GUI**,由控制列的「方法」下拉選單切換
+(清單來自 `inference/methods.py`,新增方法不必動這個檔案)。同一份輸入、
+同一組門檻、只換選單那一格,方法之間的效果才比得起來。
+
+視窗最下方是分頁列(像 Excel):
+
+- **即時偵測** —— 偵測、追蹤、警報、第二階段複核
+- **直播錄影** —— 原樣存檔不解碼,不掉幀,可長時間開著
+
+兩者互不影響、可同時跑:錄影全程不解碼(見 `inference/recorder.py`),
+不吃 GPU 也不跟偵測搶 CPU。
+
 功能:
+- 方法選擇:純規則 / 外觀網路 / 兩者融合 / 加不加第二階段複核
 - 來源選擇:攝影機編號或影片檔(瀏覽)
-- 模型權重選擇;留空則僅跑偵測+追蹤
+- 模型權重選擇(僅需要外觀網路的方法會開放此欄)
 - 即時畫面(框、track ID、階段、P_t 置信度條、警報狀態)
 - 右側面板:每個 track 的置信度進度條與階段
 - 觸發/解除門檻滑桿(即時生效)
@@ -15,6 +28,7 @@
 import argparse
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -30,11 +44,144 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
 
+from inference import methods as methods_registry  # noqa: E402
+from inference.recorder import (DEFAULT_KEEP_DAYS,  # noqa: E402
+                                DEFAULT_ROOT as DEFAULT_REC_ROOT,
+                                DEFAULT_SEGMENT_SEC, StreamRecorder,
+                                day_name, prune_days, site_slug)
+from inference.verifier import STATUS_NAMES  # noqa: E402
 from utils import load_config  # noqa: E402
 
 VIDEO_W, VIDEO_H = 800, 600
 DEFAULT_CKPT = "checkpoints/hmdb_e2e_best.pt"
 _STAGE_NAMES = {0: "S1 舉手", 1: "S2 嘴部", 2: "S3 放下", 3: "背景"}
+
+# 在場型態(值的定義在 inference/state_machine.py:PresenceClassifier)
+P_PASSING, P_RUNNING = "passing", "running"
+P_WANDERING, P_WAITING = "wandering", "waiting"
+
+_presence_names = None
+
+
+def presence_name(key: str) -> str:
+    """在場型態代號 → 中文。延後匯入 inference.pipeline(它會拉進 torch,
+    啟動時就載會拖慢開窗),但仍以那邊的對照表為唯一來源。"""
+    global _presence_names
+    if _presence_names is None:
+        from inference.pipeline import PRESENCE_NAMES
+        _presence_names = PRESENCE_NAMES
+    return _presence_names.get(key, "")
+
+
+def triage(results: dict):
+    """把當前所有 track 分成追蹤狀態面板的三欄。
+
+    純函式:面板要顯示誰是整個畫面最常被調整的地方,抽出來才改得動、
+    也測得到(tkinter 沒辦法在測試裡跑)。
+
+    回傳 (在場, 等待待確認, 已偵測抽菸),每項為 (track_id, 顯示文字)。
+
+    - **在場**:經過(走/跑)與徘徊的人 —— 也就是**還在動**的人
+    - **等待待確認**:被判為「等待」(停下來不動)且**還沒**觸發抽菸警報。
+      這一欄才是真正的候選:**站著不動的人才可疑,走過去的只是路過**。
+      抽菸是站定了才做的事,所以「等待」是最值得盯的型態,不是最該忽略的
+    - **已偵測抽菸**:警報成立中。第二階段複核把警報降為橘色時一併標示
+      (降級不否決:警報還在,只是待人工複查)
+
+    等待的人只出現在第二、三欄,不重複列進「在場」——三欄加起來就是全部,
+    看板才不會同一個人到處都是。
+    """
+    present, watching, smoking = [], [], []
+    for tid, r in sorted(results.items()):
+        pres = r.get("presence", "unknown")
+        alarm = bool(r.get("alarm"))
+        events = r.get("events", 0)
+
+        if pres != P_WAITING:
+            bits = [f"ID{tid}", presence_name(pres) or "判定中",
+                    _STAGE_NAMES.get(r.get("stage"), "")]
+            if r.get("orientation") == "back":
+                bits.append("背向")
+            if events:
+                bits.append(f"{events}次")
+            if r.get("moving"):
+                bits.append("移動中")
+            if r.get("phone"):
+                bits.append("講電話")
+            present.append((tid, " ".join(b for b in bits if b)))
+
+        if alarm:
+            note = ""
+            v = r.get("verify")
+            if v:
+                note = f" [{STATUS_NAMES.get(v, v)}]"
+            smoking.append(
+                (tid, f"ID{tid} P{r.get('P', 0.0):.2f} {events}次{note}"))
+        elif pres == P_WAITING:
+            lv = r.get("level", 0.0)
+            tag = ("警戒高" if lv >= 0.8 else "警戒中" if lv >= 0.5
+                   else "警戒低" if lv >= 0.2 else "觀察中")
+            # 欄名已經寫了「等待」,不再重複;背向要標,因為背向時骨架
+            # 棄權,那個人是「看不到手」而不是「確認沒抽」
+            back = " 背向" if r.get("orientation") == "back" else ""
+            watching.append((tid, f"ID{tid} {events}次 {tag}{back}"))
+    return present, watching, smoking
+
+
+class SlotPanel:
+    """固定格數的清單面板:track 進出只改文字、不增刪列,版面完全靜止。
+
+    原本只有一欄時這段邏輯散在 DemoGUI 裡;拆成三欄後獨立出來,三欄共用
+    同一套「格位 + 寬限」行為 —— track 短暫消失時格位保留 GRACE_SEC 秒,
+    偵測閃爍才不會讓整份清單上下跳動。
+    """
+
+    GRACE_SEC = 2.0
+
+    def __init__(self, parent, title: str, width: int, slots: int = 8,
+                 bar: bool = False):
+        self.frame = ttk.LabelFrame(parent, text=title, padding=4,
+                                    width=width)
+        self.frame.pack(side="left", fill="y", padx=(0, 4))
+        self.frame.pack_propagate(False)
+        self.slots = []
+        for _ in range(slots):
+            row = ttk.Frame(self.frame)
+            row.pack(fill="x", pady=1)
+            pb = ttk.Progressbar(row, maximum=1.0, length=60) if bar else None
+            if pb is not None:
+                pb.pack(side="right")
+            lbl = ttk.Label(row, text="—", anchor="w")
+            lbl.pack(side="left", fill="x", expand=True)
+            self.slots.append((lbl, pb))
+        self.n = slots
+        self.tid_slot = {}
+        self.tid_seen = {}
+
+    def update(self, items, now: float, values=None) -> None:
+        """items 為 [(track_id, 顯示文字)];values 可給 {track_id: 0~1} 走進度條。"""
+        for tid, text in items:
+            if tid not in self.tid_slot:
+                used = set(self.tid_slot.values())
+                free = [i for i in range(self.n) if i not in used]
+                if not free:
+                    continue          # 格位滿:不擠掉現有列,多的暫不顯示
+                self.tid_slot[tid] = free[0]
+            self.tid_seen[tid] = now
+            lbl, pb = self.slots[self.tid_slot[tid]]
+            lbl.config(text=text)
+            if pb is not None:
+                pb["value"] = (values or {}).get(tid, 0.0)
+
+        for tid in [t for t, ts in self.tid_seen.items()
+                    if now - ts > self.GRACE_SEC]:
+            slot = self.tid_slot.pop(tid, None)
+            self.tid_seen.pop(tid, None)
+            if slot is not None:
+                lbl, pb = self.slots[slot]
+                lbl.config(text="—")
+                if pb is not None:
+                    pb["value"] = 0.0
 
 
 class DemoGUI:
@@ -72,6 +219,12 @@ class DemoGUI:
         self.running = False
         self.frame_q: "queue.Queue" = queue.Queue(maxsize=2)
         self.alarm_q: "queue.Queue" = queue.Queue()
+        # 錄影分頁(獨立於偵測:不解碼、不吃 GPU,兩者可同時開著)
+        self.recorder = None
+        self.rec_thread: threading.Thread = None
+        self.rec_q: "queue.Queue" = queue.Queue()
+        self._rec_status_t = 0.0
+        self._poll_id = None
 
         # 警報片段錄製:滾動保留最近 ~10 秒取樣影格(縮小節省記憶體),
         # 警報觸發時連同後續 4 秒寫成 mp4,供記錄點擊回放
@@ -94,6 +247,7 @@ class DemoGUI:
         self.log_entries = []          # 最新在前;{'text', 'rec'}
         self.PAGE_SIZE = 8
         self.page = 1
+        self._last_draw = 0.0          # 畫面重繪節流用
 
         self._build_layout()
         self._poll_ui()
@@ -106,10 +260,25 @@ class DemoGUI:
     # ---------- 版面 ----------
 
     def _build_layout(self):
-        main = ttk.Frame(self.root, padding=6)
-        main.grid(sticky="nsew")
+        # 分頁列放在最下面(像 Excel)。ttk 的 tabposition 是兩個字元:
+        # 第一個是貼哪一邊(s = 下),第二個是沿該邊靠哪邊對齊(w = 左)。
+        # vista 主題實測支援。
+        style = ttk.Style(self.root)
+        style.configure("Bottom.TNotebook", tabposition="sw")
+        self.tabs = ttk.Notebook(self.root, style="Bottom.TNotebook")
+        self.tabs.grid(sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+
+        detect_tab = ttk.Frame(self.tabs)
+        record_tab = ttk.Frame(self.tabs)
+        self.tabs.add(detect_tab, text="  即時偵測  ")
+        self.tabs.add(record_tab, text="  直播錄影  ")
+        detect_tab.columnconfigure(0, weight=1)
+        detect_tab.rowconfigure(0, weight=1)
+
+        main = ttk.Frame(detect_tab, padding=6)
+        main.grid(sticky="nsew")
         # 影像格可伸縮:拉大視窗時影像跟著放大(_draw_frame 依實際尺寸縮放)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(0, weight=1)
@@ -128,7 +297,7 @@ class DemoGUI:
 
         # 右:追蹤狀態 + 門檻(固定寬度,文字長度變化不會抖動)
         side = ttk.LabelFrame(main, text="追蹤狀態", padding=6,
-                              width=680, height=300)
+                              width=706, height=300)
         side.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         # 注意:內部子元件用 pack 排版,尺寸傳播要用 pack_propagate 關;
         # grid_propagate 只擋 grid 子元件,關錯了面板仍會隨文字伸縮
@@ -137,20 +306,15 @@ class DemoGUI:
         self.track_panel = ttk.Frame(side)
         self.track_panel.pack(fill="both", expand=True)
 
-        # 固定欄位制:預先建好 N 列,track 進出只改文字、不增刪列,
-        # 版面完全靜止(track 閃爍時清單才不會跳動)
-        self.MAX_SLOTS = 8
-        self.slots = []              # [(lbl, bar), ...]
-        for _ in range(self.MAX_SLOTS):
-            row = ttk.Frame(self.track_panel)
-            row.pack(fill="x", pady=2)
-            bar = ttk.Progressbar(row, maximum=1.0, length=90)
-            bar.pack(side="right")
-            lbl = ttk.Label(row, text="—", anchor="w")
-            lbl.pack(side="left", fill="x", expand=True)
-            self.slots.append((lbl, bar))
-        self.tid_slot = {}           # track_id → slot index
-        self.tid_last_seen = {}      # track_id → 最後更新時間(寬限用)
+        # 三欄:在場 → 觀察中 → 已判定。由左到右就是一個人被處理的順序,
+        # 看板一眼就能回答「現在有誰、誰還在觀察、誰要處理」。
+        # 各欄都用固定格數(見 SlotPanel):track 閃爍時清單不會上下跳動。
+        self.panel_present = SlotPanel(
+            self.track_panel, "在場(經過·徘徊)", width=300, bar=True)
+        self.panel_watch = SlotPanel(
+            self.track_panel, "等待·待確認", width=180)
+        self.panel_smoke = SlotPanel(
+            self.track_panel, "⚠ 偵測到抽菸", width=190)
 
         thr = ttk.LabelFrame(main, text="警報門檻", padding=6)
         thr.grid(row=1, column=1, sticky="sew", padx=(6, 0))
@@ -232,30 +396,55 @@ class DemoGUI:
                         command=self._apply_thresholds).pack(
             anchor="w", pady=2)
 
-        # 下:控制列
+        # 下:控制列(上排選方法、下排選來源與權重)
         ctrl = ttk.Frame(main, padding=(0, 6))
         ctrl.grid(row=2, column=0, columnspan=2, sticky="ew")
-        ttk.Label(ctrl, text="來源").pack(side="left")
+
+        # 方法選單:清單直接來自 inference/methods.py 的登錄表。
+        # 新增一種抽菸判定方法時這裡不用改任何一行 —— 論文要比較各方法時,
+        # 換的只有這一格,輸入與門檻都不動,比較才公平
+        mrow = ttk.Frame(ctrl)
+        mrow.pack(fill="x")
+        ttk.Label(mrow, text="方法").pack(side="left")
+        self.method_var = tk.StringVar()
+        self.method_box = ttk.Combobox(
+            mrow, textvariable=self.method_var, state="readonly", width=40,
+            values=[self._method_label(m) for m in methods_registry.METHODS])
+        self.method_box.pack(side="left", padx=4)
+        self.method_box.bind("<<ComboboxSelected>>",
+                             lambda _e: self._on_method_change())
+        self.method_desc = ttk.Label(mrow, text="", foreground="#555555",
+                                     wraplength=760, justify="left")
+        self.method_desc.pack(side="left", padx=8, fill="x", expand=True)
+
+        row1 = ttk.Frame(ctrl)
+        row1.pack(fill="x", pady=(4, 0))
+        ttk.Label(row1, text="來源").pack(side="left")
         self.source_var = tk.StringVar(value="0")
-        ttk.Entry(ctrl, textvariable=self.source_var, width=32).pack(
+        ttk.Entry(row1, textvariable=self.source_var, width=32).pack(
             side="left", padx=4)
-        ttk.Button(ctrl, text="瀏覽…", command=self._browse_video).pack(
+        ttk.Button(row1, text="瀏覽…", command=self._browse_video).pack(
             side="left")
-        ttk.Label(ctrl, text="權重").pack(side="left", padx=(12, 0))
+        self.ckpt_label = ttk.Label(row1, text="權重")
+        self.ckpt_label.pack(side="left", padx=(12, 0))
         self.ckpt_var = tk.StringVar(
             value=DEFAULT_CKPT if Path(DEFAULT_CKPT).exists() else "")
-        ttk.Entry(ctrl, textvariable=self.ckpt_var, width=36).pack(
-            side="left", padx=4)
-        ttk.Button(ctrl, text="…", width=3, command=self._browse_ckpt).pack(
-            side="left")
-        self.start_btn = ttk.Button(ctrl, text="▶ 開始", command=self.start)
+        self.ckpt_entry = ttk.Entry(row1, textvariable=self.ckpt_var, width=36)
+        self.ckpt_entry.pack(side="left", padx=4)
+        self.ckpt_btn = ttk.Button(row1, text="…", width=3,
+                                   command=self._browse_ckpt)
+        self.ckpt_btn.pack(side="left")
+        self.start_btn = ttk.Button(row1, text="▶ 開始", command=self.start)
         self.start_btn.pack(side="left", padx=(12, 2))
-        self.stop_btn = ttk.Button(ctrl, text="■ 停止", command=self.stop,
+        self.stop_btn = ttk.Button(row1, text="■ 停止", command=self.stop,
                                    state="disabled")
         self.stop_btn.pack(side="left")
         self.status_var = tk.StringVar(value="待機")
-        ttk.Label(ctrl, textvariable=self.status_var).pack(side="left",
-                                                           padx=12)
+        ttk.Label(row1, textvariable=self.status_var).pack(
+            side="left", padx=12)
+        # 預設選項與相依欄位狀態(權重欄只在方法需要時開放)
+        self.method_var.set(self._method_label(methods_registry.default()))
+        self._on_method_change()
 
         # 警報記錄:條列式 + 分頁;警報項目可雙擊回放片段
         log_frame = ttk.LabelFrame(main, text="警報記錄(雙擊警報項目可回放片段)",
@@ -282,6 +471,87 @@ class DemoGUI:
                    command=lambda: self._goto_page(self.page + 1)).pack(
             side="left", padx=(8, 0))
 
+        self._build_record_tab(record_tab)
+
+    # ---------- 分頁二:直播錄影 ----------
+
+    def _build_record_tab(self, parent):
+        """錄影分頁。錄影與偵測是兩件不同的事,共用視窗但不共用狀態:
+        錄影全程不解碼(見 inference/recorder.py),不吃 GPU,可以和偵測
+        同時開著跑。"""
+        f = ttk.Frame(parent, padding=8)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+
+        ttk.Label(f, text="直播錄影:原樣存檔不解碼,不會掉幀,可長時間開著",
+                  foreground="#444444").grid(row=0, column=0, columnspan=4,
+                                             sticky="w", pady=(0, 8))
+
+        ttk.Label(f, text="直播網址").grid(row=1, column=0, sticky="w")
+        self.rec_url_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.rec_url_var).grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=4, pady=2)
+
+        ttk.Label(f, text="存放資料夾").grid(row=2, column=0, sticky="w")
+        self.rec_root_var = tk.StringVar(value=DEFAULT_REC_ROOT)
+        ttk.Entry(f, textvariable=self.rec_root_var).grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=2)
+        ttk.Button(f, text="瀏覽…", command=self._browse_rec_root).grid(
+            row=2, column=3, sticky="w")
+
+        # 空間預估:720p 約 30 GB/天,保留三天要 90 GB。錄到一半磁碟滿了,
+        # ffmpeg 只會安靜地停住,所以要在按下開始之前就講清楚
+        self.rec_disk_lbl = ttk.Label(f, text="")
+        self.rec_disk_lbl.grid(row=3, column=1, columnspan=3, sticky="w",
+                               padx=4)
+        self.rec_root_var.trace_add("write", lambda *_: self._update_disk_hint())
+
+        opts = ttk.Frame(f)
+        opts.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 2))
+        ttk.Label(opts, text="每段").pack(side="left")
+        self.rec_seg_var = tk.IntVar(value=DEFAULT_SEGMENT_SEC)
+        ttk.Spinbox(opts, from_=30, to=3600, increment=30, width=6,
+                    textvariable=self.rec_seg_var).pack(side="left", padx=4)
+        ttk.Label(opts, text="秒     保留").pack(side="left")
+        self.rec_keep_var = tk.IntVar(value=DEFAULT_KEEP_DAYS)
+        ttk.Spinbox(opts, from_=1, to=30, width=4,
+                    textvariable=self.rec_keep_var).pack(side="left", padx=4)
+        ttk.Label(opts, text="天(每天一個資料夾,逾期自動刪除)     畫質上限")\
+            .pack(side="left")
+        self.rec_height_var = tk.StringVar(value="720")
+        ttk.Combobox(opts, textvariable=self.rec_height_var, width=6,
+                     state="readonly",
+                     values=("360", "480", "720", "1080")).pack(side="left",
+                                                                padx=4)
+        self.rec_audio_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="錄音(預設關)",
+                        variable=self.rec_audio_var).pack(side="left", padx=8)
+
+        btns = ttk.Frame(f)
+        btns.grid(row=5, column=0, columnspan=4, sticky="w", pady=6)
+        self.rec_start_btn = ttk.Button(btns, text="● 開始錄影",
+                                        command=self.start_record)
+        self.rec_start_btn.pack(side="left")
+        self.rec_stop_btn = ttk.Button(btns, text="■ 停止錄影",
+                                       command=self.stop_record,
+                                       state="disabled")
+        self.rec_stop_btn.pack(side="left", padx=4)
+        ttk.Button(btns, text="開啟資料夾",
+                   command=self._open_rec_folder).pack(side="left", padx=4)
+        ttk.Button(btns, text="檢查保留(不刪除)",
+                   command=self._preview_prune).pack(side="left", padx=4)
+        self.rec_status_var = tk.StringVar(value="未開始")
+        ttk.Label(btns, textvariable=self.rec_status_var).pack(
+            side="left", padx=12)
+
+        log_box = ttk.LabelFrame(f, text="錄影記錄", padding=4)
+        log_box.grid(row=6, column=0, columnspan=4, sticky="nsew", pady=(6, 0))
+        f.rowconfigure(6, weight=1)
+        self.rec_log = tk.Listbox(log_box, height=12)
+        self.rec_log.pack(fill="both", expand=True)
+
+        self._update_disk_hint()
+
     def _show_placeholder(self, text: str):
         """在影像區顯示固定像素尺寸的佔位畫面(含提示文字)。"""
         from PIL import ImageDraw, ImageFont
@@ -302,6 +572,158 @@ class DemoGUI:
         self.canvas.coords(self._canvas_item, cw // 2, ch // 2)
         self.canvas.itemconfigure(self._canvas_item, image=photo)
         self.canvas.image = photo
+
+    # ---------- 錄影分頁的行為 ----------
+
+    def _rec_site_root(self) -> Path:
+        url = self.rec_url_var.get().strip()
+        root = Path(self.rec_root_var.get().strip() or DEFAULT_REC_ROOT)
+        return root / site_slug(url) if url else root
+
+    def _browse_rec_root(self):
+        p = filedialog.askdirectory(title="選擇錄影存放資料夾")
+        if p:
+            self.rec_root_var.set(p)
+
+    def _update_disk_hint(self):
+        """顯示存放磁碟的可用空間,不足時變紅。
+
+        720p 實測約 30 GB/天;磁碟滿的時候 ffmpeg 只會安靜地停住,
+        所以這件事要在按下開始之前就看得到,不是事後才發現。
+        """
+        try:
+            root = Path(self.rec_root_var.get().strip() or DEFAULT_REC_ROOT)
+            probe = root
+            while not probe.exists() and probe.parent != probe:
+                probe = probe.parent
+            free = shutil.disk_usage(probe).free / 2**30
+            need = 30.0 * max(1, int(self.rec_keep_var.get()))
+            short = free < need
+            self.rec_disk_lbl.config(
+                text=f"可用 {free:.0f} GB;720p 約 30 GB/天,"
+                     f"保留設定約需 {need:.0f} GB"
+                     + ("  ⚠ 空間可能不足" if short else ""),
+                foreground="#b00000" if short else "#444444")
+        except (OSError, tk.TclError, ValueError):
+            self.rec_disk_lbl.config(text="")
+
+    def start_record(self):
+        if self.recorder is not None:
+            return
+        url = self.rec_url_var.get().strip()
+        if not url:
+            messagebox.showerror("缺少網址", "請先填入直播網址。")
+            return
+        try:
+            rec = StreamRecorder(
+                url, root=self.rec_root_var.get().strip() or DEFAULT_REC_ROOT,
+                segment_sec=int(self.rec_seg_var.get()),
+                keep_days=int(self.rec_keep_var.get()),
+                max_height=int(self.rec_height_var.get()),
+                audio=bool(self.rec_audio_var.get()),
+                log=self.rec_q.put)
+        except Exception as e:
+            messagebox.showerror("無法開始錄影", str(e))
+            return
+        self.recorder = rec
+        self.rec_start_btn.config(state="disabled")
+        self.rec_stop_btn.config(state="normal")
+        self.rec_status_var.set("錄影中…")
+
+        def work():
+            try:
+                rec.run()
+            except Exception as e:                # 錄影失敗不該拖垮 GUI
+                self.rec_q.put(f"[錯誤] {e}")
+            finally:
+                # 只放下旗標,不從這裡碰 UI:tkinter 不是執行緒安全的,
+                # 連 root.after() 都不行(視窗剛好在關閉時會炸
+                # "main thread is not in main loop")。由 _poll_ui 在主
+                # 執行緒發現 recorder 變 None 之後自己把按鈕復原。
+                self.recorder = None
+        self.rec_thread = threading.Thread(target=work, daemon=True)
+        self.rec_thread.start()
+
+    def stop_record(self):
+        if self.recorder is not None:
+            self.rec_status_var.set("停止中…")
+            self.recorder.stop()
+
+    def _reset_rec_buttons(self):
+        self.rec_start_btn.config(state="normal")
+        self.rec_stop_btn.config(state="disabled")
+        self.rec_status_var.set("已停止")
+
+    def _open_rec_folder(self):
+        site = self._rec_site_root()
+        site.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(site))          # noqa: S606 (Windows 專用)
+
+    def _preview_prune(self):
+        """列出保留天數會刪掉哪些資料夾,但**不刪**。
+
+        自動刪除資料夾是不可逆的,所以給一個先看再說的入口。
+        """
+        site = self._rec_site_root()
+        try:
+            keep = max(1, int(self.rec_keep_var.get()))
+            doomed = prune_days(site, keep, dry_run=True)
+        except (ValueError, tk.TclError) as e:
+            messagebox.showerror("檢查失敗", str(e))
+            return
+        if not doomed:
+            messagebox.showinfo(
+                "保留檢查", f"{site}\n\n沒有超出 {keep} 天的資料夾,"
+                            f"目前不會刪除任何東西。")
+        else:
+            messagebox.showwarning(
+                "保留檢查",
+                f"{site}\n\n下次維護時會刪除這 {len(doomed)} 個資料夾:\n"
+                + "\n".join(d.name for d in doomed))
+
+    def _refresh_rec_status(self):
+        """每兩秒更新一次今天的錄影量(只看檔案系統,不呼叫 ffmpeg)。"""
+        if self.recorder is None:
+            return
+        day = self._rec_site_root() / day_name()
+        try:
+            files = sorted(day.glob("*.ts"))
+            size = sum(p.stat().st_size for p in files) / 2**30
+        except OSError:
+            return
+        self.rec_status_var.set(
+            f"錄影中 {len(files)} 段 {size:.2f} GB"
+            + (f" 重連{self.recorder.restarts}" if self.recorder.restarts
+               else ""))
+
+    # ---------- 方法選擇 ----------
+
+    @staticmethod
+    def _method_label(m) -> str:
+        """選單顯示文字:缺權重的方法照樣列出,但標明缺什麼。
+
+        不把不可用的方法藏起來:使用者要知道還有這條路存在、以及少了
+        哪個檔案才能走。
+        """
+        return m.name if m.available else f"{m.name}(缺權重)"
+
+    def _current_method(self):
+        label = self.method_var.get()
+        for m in methods_registry.METHODS:
+            if self._method_label(m) == label:
+                return m
+        return methods_registry.default()
+
+    def _on_method_change(self):
+        """切換方法:更新說明文字,並開關「權重」欄。"""
+        m = self._current_method()
+        tag = "判定不含學習權重" if m.ai_free_decision else "含學習權重"
+        self.method_desc.config(text=f"[{m.key} / {tag}] {m.desc}")
+        state = "normal" if m.needs_appearance else "disabled"
+        for w in (self.ckpt_entry, self.ckpt_btn):
+            w.config(state=state)
+        self.ckpt_label.config(
+            text="權重" if m.needs_appearance else "權重(此方法不需)")
 
     # ---------- 控制 ----------
 
@@ -347,22 +769,40 @@ class DemoGUI:
     def start(self):
         if self.running:
             return
+        method = self._current_method()
+        if method.missing():
+            messagebox.showerror(
+                "缺少權重",
+                f"方法「{method.name}」需要以下檔案:\n"
+                + "\n".join(method.missing())
+                + "\n\n請先訓練或搬入權重,或改選其他方法。")
+            return
+        if method.needs_appearance and not self.ckpt_var.get().strip():
+            messagebox.showerror(
+                "缺少權重",
+                f"方法「{method.name}」需要外觀網路權重,請在「權重」欄指定。")
+            return
         self.start_btn.config(state="disabled")
         self.status_var.set("載入模型中…")
-        threading.Thread(target=self._start_worker, daemon=True).start()
+        threading.Thread(target=self._start_worker, args=(method,),
+                         daemon=True).start()
 
-    def _start_worker(self):
+    def _start_worker(self, method):
         """在背景執行緒載入 pipeline(避免凍住 UI),然後開始處理。"""
         try:
             from inference.pipeline import SmokingDetectionPipeline
             infer_cfg = load_config(self.infer_config)
             ckpt = self.ckpt_var.get().strip()
-            use_model = bool(ckpt)
+            # 要不要載外觀網路由方法決定,不再由「權重欄有沒有填」決定 ——
+            # 否則選了純規則卻忘了清空權重欄,跑的其實是融合版
+            use_model = method.needs_appearance
             model_cfg = load_config("configs/model.yaml") if use_model else None
 
             pipeline = SmokingDetectionPipeline(
                 infer_cfg, model_cfg,
-                ckpt_path=ckpt or None, use_model=use_model)
+                ckpt_path=(ckpt or None) if use_model else None,
+                use_model=use_model, method=method)
+            self.alarm_q.put(f"[方法] {method.key} — {method.name}")
             # 警報 callback 導向 GUI 記錄(同時沿用截圖行為)
             from inference.alarm import default_alarm_callback
             snap_dir = infer_cfg["alarm"]["snapshot_dir"]
@@ -403,6 +843,18 @@ class DemoGUI:
                             f"移動 {path:.1f} 倍身高)",
                     "rec": None})
             pipeline.on_presence = log_wander
+
+            # 第二階段複核結果:雙擊該列可看完整的基元時間軸與節律統計。
+            # 這是兩層架構最大的賣點 —— 複查誤報時看得到系統憑什麼判
+            def log_verify(tid, res):
+                icon = {"confirmed": "✔", "review": "△",
+                        "abstain": "?"}.get(res.status, "·")
+                text = (time.strftime("%H:%M:%S")
+                        + f"  {icon} track {tid} 二次複核:{res.status_name}"
+                        + f" — {res.reason} — 雙擊看依據")
+                self.alarm_q.put({"text": text, "rec": None,
+                                  "detail": res.detail})
+            pipeline.on_verify = log_verify
             pipeline.on_log = lambda msg: (
                 self.alarm_q.put(time.strftime("%H:%M:%S") + "  " + msg)
                 if self._diag_enabled else None)
@@ -427,7 +879,9 @@ class DemoGUI:
         from inference.stream import VideoSource
         from inference.pipeline import draw_overlay
         try:
-            vs = VideoSource(src, **self.pipeline.cfg.get("stream", {}))
+            vs = VideoSource(
+                src, sample_fps=self.pipeline.cfg["sampling"]["target_fps"],
+                **self.pipeline.cfg.get("stream", {}))
         except Exception as e:
             self.alarm_q.put(f"[錯誤] 無法開啟來源:{e}")
             self.running = False
@@ -441,6 +895,9 @@ class DemoGUI:
         idx, results = 0, {}
         last_proc = float("-inf")
         t_prev = time.time()
+        # 實際推理速率:卡的時候要看得出是「來源餵不夠」還是「機器跑不動」,
+        # 不然只能猜。lag<1 = 正被直播拉開,佇列見底 = 來源慢
+        fps_t0, fps_n = time.time(), 0
         while self.running:
             frame, ts = vs.read(timeout=2.0)
             if frame is None:
@@ -449,13 +906,27 @@ class DemoGUI:
                     continue
                 self.alarm_q.put("[資訊] 影片播放結束")
                 break
-            if vs.is_live:
+            if getattr(vs, "pre_sampled", False):
+                do_step = True      # 來源已抽稀到 target_fps,不再濾一次
+            elif vs.is_live:
                 do_step = ts - last_proc >= min_interval
             else:
                 do_step = idx % step == 0
             if do_step:
                 results = self.pipeline.step(frame, ts)
                 last_proc = ts
+                fps_n += 1
+                if time.time() - fps_t0 >= 1.0:
+                    rate = fps_n / (time.time() - fps_t0)
+                    extra = ""
+                    if getattr(vs, "queued", False):
+                        extra = (f" 佇列{len(vs._queue)}"
+                                 f" 落後比{vs.lag_ratio:.2f}")
+                    # tk 變數只能在主執行緒改
+                    self.root.after(
+                        0, lambda r=rate, e=extra:
+                        self.status_var.set(f"執行中 {r:.1f} fps{e}"))
+                    fps_t0, fps_n = time.time(), 0
             vis = draw_overlay(frame, results)
             if do_step:
                 # 存檔用哪一份由開關決定:關 = 乾淨原始影格(可訓練外觀模型)
@@ -472,6 +943,7 @@ class DemoGUI:
                     time.sleep(dt)
             t_prev = time.time()
         vs.release()
+        self.pipeline.close()   # 收掉複核執行緒池(每次「開始」都會新建一條管線)
         self.running = False
         self.root.after(0, self._reset_buttons)
 
@@ -486,15 +958,33 @@ class DemoGUI:
 
     def on_close(self):
         self.running = False
+        if self._poll_id is not None:
+            self.root.after_cancel(self._poll_id)
+            self._poll_id = None
+        # 錄影一定要等它收乾淨:ffmpeg 是獨立行程,直接關視窗會留下孤兒
+        # 行程繼續寫檔案(而且沒人管得到它)。等一下下比留孤兒好。
+        if self.recorder is not None:
+            self.recorder.stop()
+            if self.rec_thread is not None:
+                self.rec_thread.join(timeout=8.0)
         self.root.after(150, self.root.destroy)
 
     # ---------- UI 更新 ----------
 
+    # 畫面重繪上限(秒)。重繪跑在 Tk 主執行緒且持有 GIL,實測
+    # 800×600 要 5.8 ms、放大到 1600×900 要 21.5 ms;不設上限的話
+    # 光是畫圖就能吃掉大半個主執行緒,連帶餓死收幀執行緒 —— 串流會
+    # 因此掉幀。推理不受影響(每一幀都照跑),這裡限的只是「顯示」。
+    DRAW_INTERVAL = 1.0 / 15
+
     def _poll_ui(self):
         try:
             vis, results = self.frame_q.get_nowait()
-            self._draw_frame(vis)
-            self._update_tracks(results)
+            now = time.time()
+            if now - self._last_draw >= self.DRAW_INTERVAL:
+                self._draw_frame(vis)
+                self._last_draw = now
+            self._update_tracks(results)     # 文字面板很便宜,照常更新
         except queue.Empty:
             pass
         changed = False
@@ -509,7 +999,24 @@ class DemoGUI:
             pass
         if changed:
             self._render_log()
-        self.root.after(30, self._poll_ui)
+        # 錄影分頁:訊息照單全收,狀態每兩秒才刷一次(要掃資料夾,別太勤)
+        try:
+            while True:
+                self.rec_log.insert(0, self.rec_q.get_nowait())
+                if self.rec_log.size() > 300:
+                    self.rec_log.delete(300, tk.END)
+        except queue.Empty:
+            pass
+        # 錄影執行緒結束後由主執行緒復原按鈕(見 start_record 的說明)
+        if self.recorder is None and str(self.rec_stop_btn["state"]) != \
+                "disabled":
+            self._reset_rec_buttons()
+        elif time.time() - self._rec_status_t >= 2.0:
+            self._rec_status_t = time.time()
+            self._refresh_rec_status()
+        # 記住排程 id:關視窗時要取消,否則 destroy 之後那個 callback 還會
+        # 觸發一次,在主控台留下 invalid command name "..._poll_ui"
+        self._poll_id = self.root.after(30, self._poll_ui)
 
     # ---------- 警報片段錄製 ----------
 
@@ -637,9 +1144,12 @@ class DemoGUI:
         idx = (self.page - 1) * self.PAGE_SIZE + sel[0]
         if idx >= len(self.log_entries):
             return
-        rec = self.log_entries[idx].get("rec")
+        entry = self.log_entries[idx]
+        rec = entry.get("rec")
         if rec is None:
-            return                      # 非警報項目
+            if entry.get("detail"):     # 複核結果:顯示判定依據
+                DetailWindow(self.root, entry["text"], entry["detail"])
+            return                      # 其餘非警報項目
         if rec.get("path") is None:
             messagebox.showinfo("片段錄製中",
                                 "警報片段還在錄製(觸發後續錄 4 秒),"
@@ -660,55 +1170,32 @@ class DemoGUI:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         self._set_canvas_image(ImageTk.PhotoImage(Image.fromarray(img)))
 
-    GRACE_SEC = 2.0   # track 短暫消失的寬限:格位保留,避免清單跳動
-
     def _update_tracks(self, results):
+        """把當前 track 分流到三欄。分類規則在 triage()(純函式,有測試)。"""
         now = time.time()
+        present, watching, smoking = triage(results)
+        levels = {tid: r.get("P", 0.0) for tid, r in results.items()}
+        self.panel_present.update(present, now, levels)
+        self.panel_watch.update(watching, now)
+        self.panel_smoke.update(smoking, now)
 
-        # 1) 更新在畫面上的 track(必要時分配空格位)
-        for tid, r in sorted(results.items()):
-            if tid not in self.tid_slot:
-                used = set(self.tid_slot.values())
-                free = [i for i in range(self.MAX_SLOTS) if i not in used]
-                if not free:
-                    continue  # 格位滿(>8 人)暫不顯示,不擠掉現有列
-                self.tid_slot[tid] = free[0]
-            self.tid_last_seen[tid] = now
 
-            lbl, bar = self.slots[self.tid_slot[tid]]
-            level = r.get("level", 0.0)
-            lv = ("高" if level >= 0.8 else
-                  "中" if level >= 0.5 else
-                  "低" if level >= 0.2 else "")
-            text = f"ID{tid} {_STAGE_NAMES.get(r['stage'], '?')}"
-            if r.get("orientation") == "back":
-                text += " 背向"
-            if r.get("events"):
-                text += f" {r['events']}次"
-            if lv:
-                text += f" 警戒{lv}"
-            if r.get("unverified"):
-                text += " 無法確認"
-            if r.get("loiter"):
-                text += " 逗留"
-            if r.get("moving"):
-                text += " 移動中"
-            if r.get("phone"):
-                text += " 講電話"
-            if r["alarm"]:
-                text += " ⚠"
-            lbl.config(text=text)
-            bar["value"] = r["P"]
+class DetailWindow(tk.Toplevel):
+    """判定依據視窗:等寬字顯示基元時間軸、節律統計與各類別分數。"""
 
-        # 2) 消失超過寬限的 track 才釋放格位(清成「—」,列不刪除)
-        for tid in [t for t, ts in self.tid_last_seen.items()
-                    if now - ts > self.GRACE_SEC]:
-            slot = self.tid_slot.pop(tid, None)
-            self.tid_last_seen.pop(tid, None)
-            if slot is not None:
-                lbl, bar = self.slots[slot]
-                lbl.config(text="—")
-                bar["value"] = 0.0
+    def __init__(self, master, title: str, text: str):
+        super().__init__(master)
+        self.title(title.strip())
+        box = tk.Text(self, wrap="none", font=("Consolas", 10),
+                      width=64, height=22)
+        sb = ttk.Scrollbar(self, orient="vertical", command=box.yview)
+        box.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        box.pack(fill="both", expand=True)
+        box.insert("1.0", text)
+        box.configure(state="disabled")   # 只讀,但仍可選取複製
+        self.attributes("-topmost", True)
+        self.after(500, lambda: self.attributes("-topmost", False))
 
 
 class ClipPlayer(tk.Toplevel):
@@ -790,10 +1277,18 @@ def main():
                         if Path("configs/inference_hmdb.yaml").exists()
                         else "configs/inference.yaml",
                         help="推理設定(HMDB 權重用 inference_hmdb.yaml)")
+    parser.add_argument("--method", default=None,
+                        choices=methods_registry.keys(),
+                        help="預選判定方法(見 inference/methods.py);"
+                             "省略則用預設,啟動後仍可在選單改")
     args = parser.parse_args()
 
     root = tk.Tk()
     app = DemoGUI(root, infer_config=args.infer_config)
+    if args.method:
+        app.method_var.set(
+            app._method_label(methods_registry.get(args.method)))
+        app._on_method_change()
 
     if args.autotest:
         app.source_var.set(args.autotest)
