@@ -31,3 +31,6 @@ recordings/
 
 # 下載的影片
 downloads/
+
+# 影片分析的側車檔
+.analysis/

@@ -28,8 +28,13 @@ from typing import List, Optional
 import cv2
 from PIL import Image, ImageTk
 
+from ui.analysis import Analysis, analyse_video
+
 SPEEDS = (0.25, 0.5, 1.0, 1.5, 2.0)
 SEEK_STEP_SEC = 5.0
+# 一次最多補跳幾幀。設上限是為了避免「卡了一下 → 一次跳掉兩秒」,
+# 那比稍微慢一點更難看清楚動作。
+MAX_SKIP_FRAMES = 4
 BAR_H = 26
 SNAPSHOT_DIR = "snapshots"
 
@@ -136,6 +141,65 @@ class SeekBar(tk.Canvas):
                          width=0)
 
 
+class MarkerAxis(tk.Canvas):
+    """播放器下方的標記軸:所有標記點都畫在上面,按一下就跳過去。
+
+    與上面那條進度條的分工:進度條是「現在播到哪」,這條是「有哪些值得看
+    的地方」。分開之後,標記不會被播放頭蓋住,點也可以畫得夠大按得到——
+    進度條上的細線只夠看,按不準。
+    """
+
+    H = 46
+    R = 7                     # 點的半徑;要按得到就不能太小
+
+    def __init__(self, parent, on_seek):
+        super().__init__(parent, height=self.H, highlightthickness=0,
+                         background="#232323")
+        self.on_seek = on_seek
+        self.duration = 0.0
+        self.marks = []       # [(時間, 種類)] 種類為 detect / manual
+        self._hit = []        # [(x, 時間)] 供點擊比對
+        self.bind("<Button-1>", self._click)
+        self.bind("<Configure>", lambda _e: self.redraw())
+
+    def _click(self, event):
+        if not self._hit:
+            return
+        # 點最近的那一個(容差 12px);沒點中就當一般的時間軸跳轉
+        x, best = event.x, None
+        for hx, ht in self._hit:
+            if abs(hx - x) <= 12 and (best is None or abs(hx - x) < best[0]):
+                best = (abs(hx - x), ht)
+        if best is not None:
+            self.on_seek(best[1])
+        elif self.duration > 0:
+            w = max(self.winfo_width(), 1)
+            self.on_seek(max(0.0, min(self.duration, x / w * self.duration)))
+
+    def set_marks(self, marks) -> None:
+        self.marks = sorted(marks, key=lambda m: m[0])
+        self.redraw()
+
+    def redraw(self) -> None:
+        self.delete("all")
+        w = max(self.winfo_width(), 1)
+        y = 18
+        self.create_line(0, y, w, y, fill="#4a4a4a", width=2)
+        self._hit = []
+        if not self.marks:
+            self.create_text(8, self.H - 12, anchor="w", fill="#777777",
+                             text="(還沒有標記)")
+            return
+        for t, kind in self.marks:
+            x = (t / self.duration) * w if self.duration > 0 else 0
+            colour = "#ff4d4d" if kind == "detect" else "#ffd24d"
+            self.create_oval(x - self.R, y - self.R, x + self.R, y + self.R,
+                             fill=colour, outline="#1a1a1a")
+            self.create_text(x, self.H - 12, text=format_time(t),
+                             fill="#cccccc", font=("", 8))
+            self._hit.append((x, t))
+
+
 class VideoPlayer(tk.Toplevel):
     """播放單一影片,帶標記資料集所需的控制項。
 
@@ -145,7 +209,8 @@ class VideoPlayer(tk.Toplevel):
     """
 
     def __init__(self, master, path: str, title: str = "",
-                 method=None, infer_config: str = "configs/inference.yaml"):
+                 method=None, infer_config: str = "configs/inference.yaml",
+                 analysis=None):
         super().__init__(master)
         self.path = str(path)
         self.title(title or Path(self.path).name)
@@ -180,8 +245,13 @@ class VideoPlayer(tk.Toplevel):
         self._frame_idx = 0
         self._next_at = time.perf_counter()   # 下一幀該出現的時刻
         self._last_bar_draw = 0.0
+        self._dropped = 0
 
         self._build()
+        if analysis:
+            # 播放之前就分析好了(見 ui/analysis.py):標記與骨架直接就位,
+            # 不必等使用者自己去按,也不必邊播邊算
+            self.apply_analysis(analysis)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self._bind_keys()
         self.attributes("-topmost", True)
@@ -238,9 +308,13 @@ class VideoPlayer(tk.Toplevel):
         ttk.Button(row, text="全螢幕", command=self.toggle_fullscreen).pack(
             side="left")
 
+        self.axis = MarkerAxis(self, on_seek=self.seek_to)
+        self.axis.duration = self.duration
+        self.axis.pack(fill="x", padx=6, pady=(2, 0))
+
         row2 = ttk.Frame(self, padding=(6, 0))
         row2.pack(fill="x", pady=(0, 4))
-        self.scan_btn = ttk.Button(row2, text="🔍 分析影片",
+        self.scan_btn = ttk.Button(row2, text="🔍 重新分析",
                                    command=self.toggle_scan)
         self.scan_btn.pack(side="left")
         ttk.Button(row2, text="◀ 標記",
@@ -352,10 +426,21 @@ class VideoPlayer(tk.Toplevel):
         period = frame_delay_ms(self.fps, self.speed) / 1000.0
         now = time.perf_counter()
         self._next_at += period
-        if self._next_at < now - period:
-            # 落後超過一整個週期(視窗很大、或開了骨架疊加)就重新對時。
-            # 不重對的話會一直用 1ms 排程狂追,追不上還把 CPU 吃滿。
-            self._next_at = now + period
+        # 追不上就丟幀——這是播放器該有的行為,不是妥協。60fps 的片子
+        # 每幀只有 16.7ms 的預算,而 1600×900 解碼+繪圖要 12~25ms,
+        # 不丟幀就只能愈拖愈慢(實測 1080p60 只有 0.36x)。
+        # grab() 不做色彩轉換與回傳,比 read() 便宜得多。
+        behind = now - self._next_at
+        if behind > period:
+            skip = min(int(behind / period), MAX_SKIP_FRAMES)
+            for _ in range(skip):
+                if not self.cap.grab():
+                    break
+                self._next_at += period
+                self._dropped += 1
+            now = time.perf_counter()
+        if self._next_at < now - period * 2:
+            self._next_at = now + period      # 落後太多(例如剛從背景切回來)就重新對時
         self.after(max(1, int((self._next_at - now) * 1000)), self._tick)
 
     def redraw_current(self):
@@ -374,9 +459,16 @@ class VideoPlayer(tk.Toplevel):
         s = min(cw / w, ch / h)
         small = cv2.resize(frame, (max(1, int(w * s)), max(1, int(h * s))))
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-        self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        img = Image.fromarray(rgb)
+        # 尺寸沒變就把畫素貼進既有的 PhotoImage,不要每幀重配一張——
+        # 配置一張 1600×900 的 PhotoImage 約 4ms,在 60fps 的預算裡是硬傷
+        if (self._photo is not None
+                and (self._photo.width(), self._photo.height()) == img.size):
+            self._photo.paste(img)
+        else:
+            self._photo = ImageTk.PhotoImage(img)
+            self.canvas.itemconfigure(self._item, image=self._photo)
         self.canvas.coords(self._item, cw // 2, ch // 2)
-        self.canvas.itemconfigure(self._item, image=self._photo)
 
     # ---------- 骨架疊加 ----------
 
@@ -409,18 +501,36 @@ class VideoPlayer(tk.Toplevel):
                 pass                  # 壞資料不該讓播放停掉
         return vis
 
+    def apply_analysis(self, a) -> None:
+        """套用分析結果:抽菸位置進標記,骨架進快取。"""
+        self.bar.detected = list(a.alarms)
+        self.pose_cache = dict(a.poses)
+        self._pose_stride = a.stride
+        self._sync_marks()
+        n = len(a.alarms)
+        self.status.set(
+            (f"分析完成:{n} 處抽菸,按下面的點可直接跳過去"
+             if n else "分析完成:沒有找到抽菸警報")
+            + (f";骨架 {len(self.pose_cache)} 幀已備妥"
+               if self.pose_cache else ""))
+
+    def _sync_marks(self) -> None:
+        self.bar.redraw()
+        self.axis.set_marks([(t, "detect") for t in self.bar.detected]
+                            + [(t, "manual") for t in self.bar.manual])
+
     # ---------- 標記 ----------
 
     def add_manual(self):
         self.bar.manual.append(self.position)
-        self.bar.redraw()
+        self._sync_marks()
         self.status.set(f"已標記 {format_time(self.position)}"
                         f"(共 {len(self.bar.manual)} 個手動標記)")
 
     def clear_marks(self):
         self.bar.manual.clear()
         self.bar.detected.clear()
-        self.bar.redraw()
+        self._sync_marks()
         self.status.set("標記已清除")
 
     def jump_marker(self, forward: bool):
@@ -442,62 +552,23 @@ class VideoPlayer(tk.Toplevel):
         self._scan_cancel.clear()
         self.bar.detected.clear()
         self.pose_cache.clear()
-        self.scan_btn.config(text="■ 停止分析")
+        self.scan_btn.config(text="■ 停止")
         self.status.set("分析中…")
         self._scan_thread = threading.Thread(target=self._scan, daemon=True)
         self._scan_thread.start()
 
     def _scan(self):
-        """整支影片跑一次即時管線,把警報時間收成標記。
-
-        另外開一個 VideoCapture:播放用的那個由主執行緒在動,兩邊共用
-        會互相把讀取位置搶掉。
-        """
+        """整支跑一次分析(與播放前那一趟是同一個函式,行為一致)。"""
         try:
-            from inference.pipeline import SmokingDetectionPipeline
-            from utils import load_config
-            cfg = load_config(self.infer_config)
-            model_cfg = None
-            ckpt = None
-            if self.method is not None and self.method.needs_appearance:
-                model_cfg = load_config("configs/model.yaml")
-                ckpt = "checkpoints/hmdb_e2e_best.pt"
-            pipe = SmokingDetectionPipeline(
-                cfg, model_cfg, ckpt_path=ckpt,
-                use_model=bool(model_cfg), method=self.method)
-            hits = []
-            pipe.alarm.callback = lambda tid, P, t, fr: hits.append(t)
-
-            cap = cv2.VideoCapture(self.path)
-            target = cfg["sampling"]["target_fps"]
-            step = max(1, round(self.fps / target))
-            i = 0
-            try:
-                while not self._scan_cancel.is_set():
-                    ok, frame = cap.read()
-                    if not ok:
-                        break
-                    if i % step == 0:
-                        res = pipe.step(frame, i / self.fps)
-                        # 這一趟本來就跑了姿態偵測,關鍵點順手留下來給
-                        # 骨架疊加用——不留的話播放時就得每幀重跑一次
-                        kp = [r["kpts"] for r in res.values()
-                              if r.get("kpts") is not None]
-                        if kp:
-                            self._scan_q.put(("pose", (i, kp)))
-                        if hits:
-                            for t in hits:
-                                self._scan_q.put(("hit", t))
-                            hits.clear()
-                        if i % (step * 50) == 0 and self.duration:
-                            self._scan_q.put(
-                                ("progress", (i / self.fps) / self.duration))
-                    i += 1
-            finally:
-                cap.release()
-                pipe.close()
-            self._scan_q.put(("stride", step))
-            self._scan_q.put(("done", self._scan_cancel.is_set()))
+            a = analyse_video(
+                self.path, method=self.method,
+                infer_config=self.infer_config,
+                on_progress=lambda frac, n: self._scan_q.put(
+                    ("progress", (frac, n))),
+                cancel=self._scan_cancel)
+            if not self._scan_cancel.is_set():
+                a.save(self.path)      # 存側車檔,下次開就不必再跑
+            self._scan_q.put(("result", a))
         except Exception as e:
             self._scan_q.put(("error", f"分析失敗:{e}"))
 
@@ -508,31 +579,15 @@ class VideoPlayer(tk.Toplevel):
         try:
             while True:
                 kind, payload = self._scan_q.get_nowait()
-                if kind == "hit":
-                    self.bar.detected.append(payload)
-                    self.bar.redraw()
-                elif kind == "progress":
-                    self.status.set(
-                        f"分析中… {payload:.0%}"
-                        f"(抽菸 {len(self.bar.detected)} 處、"
-                        f"骨架 {len(self.pose_cache)} 幀)")
-                elif kind == "done":
-                    self.scan_btn.config(text="🔍 分析影片")
-                    n = len(self.bar.detected)
-                    self.status.set(
-                        ("分析已取消。" if payload else "分析完成。")
-                        + (f"找到 {n} 處抽菸,按「標記 ▶」逐一查看"
-                           if n else "沒有找到抽菸警報")
-                        + (f";骨架已備妥 {len(self.pose_cache)} 幀"
-                           if self.pose_cache else ""))
+                if kind == "progress":
+                    frac, n = payload
+                    self.status.set(f"分析中… {frac:.0%}(已找到 {n} 處)")
+                elif kind == "result":
+                    self.apply_analysis(payload)
+                    self.scan_btn.config(text="🔍 重新分析")
                     self.redraw_current()
-                elif kind == "pose":
-                    idx, kp = payload
-                    self.pose_cache[idx] = kp
-                elif kind == "stride":
-                    self._pose_stride = payload
                 elif kind == "error":
-                    self.scan_btn.config(text="🔍 分析影片")
+                    self.scan_btn.config(text="🔍 重新分析")
                     self.status.set(payload)
         except Empty:
             pass
@@ -571,3 +626,92 @@ class VideoPlayer(tk.Toplevel):
         except Exception:
             pass
         self.destroy()
+
+
+class AnalysisDialog(tk.Toplevel):
+    """播放前先跑分析的進度視窗。可取消——分析一支長片要好幾分鐘。"""
+
+    def __init__(self, master, path: str, method=None,
+                 infer_config: str = "configs/inference.yaml"):
+        super().__init__(master)
+        self.title("分析影片中")
+        self.resizable(False, False)
+        self.result = None
+        self.cancelled = False
+        self._cancel = threading.Event()
+        self._q: Queue = Queue()
+
+        frm = ttk.Frame(self, padding=14)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=Path(path).name, wraplength=420).pack(anchor="w")
+        ttk.Label(frm, text="先跑一次抽菸判定,順便把骨架算好;"
+                            "跑完才開始播放。原始影片不會被改動。",
+                  foreground="#666666", wraplength=420,
+                  justify="left").pack(anchor="w", pady=(2, 8))
+        self.bar = ttk.Progressbar(frm, maximum=1.0, length=420)
+        self.bar.pack(fill="x")
+        self.msg = tk.StringVar(value="準備中…")
+        ttk.Label(frm, textvariable=self.msg).pack(anchor="w", pady=(6, 8))
+        ttk.Button(frm, text="取消", command=self._cancel_now).pack(
+            anchor="e")
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel_now)
+        self.transient(master)
+        self.grab_set()
+        threading.Thread(target=self._work, args=(path, method, infer_config),
+                         daemon=True).start()
+        self._poll()
+
+    def _work(self, path, method, infer_config):
+        try:
+            a = analyse_video(
+                path, method=method, infer_config=infer_config,
+                on_progress=lambda f, n: self._q.put(("p", (f, n))),
+                cancel=self._cancel)
+            if not self._cancel.is_set():
+                a.save(path)
+            self._q.put(("done", a))
+        except Exception as e:
+            self._q.put(("err", str(e)))
+
+    def _cancel_now(self):
+        self.cancelled = True
+        self._cancel.set()
+        self.msg.set("取消中…")
+
+    def _poll(self):
+        try:
+            while True:
+                kind, payload = self._q.get_nowait()
+                if kind == "p":
+                    frac, n = payload
+                    self.bar["value"] = frac
+                    self.msg.set(f"分析中… {frac:.0%}(已找到 {n} 處抽菸)")
+                elif kind == "done":
+                    self.result = payload
+                    self.destroy()
+                    return
+                elif kind == "err":
+                    messagebox.showerror("分析失敗", payload, parent=self)
+                    self.destroy()
+                    return
+        except Empty:
+            pass
+        self.after(80, self._poll)
+
+
+def open_video(master, path: str, title: str = "", method=None,
+               infer_config: str = "configs/inference.yaml"):
+    """開一支影片:**先分析、再播放**。
+
+    有側車檔就直接載入(分析一支十分鐘的片要好幾分鐘,每次重開都重跑
+    沒人受得了);沒有才跑一次並存起來。使用者取消分析仍然照常播放,
+    只是沒有標記——不該因為不想等就連看都不能看。
+    """
+    a = Analysis.load(path)
+    if a is None:
+        dlg = AnalysisDialog(master, path, method, infer_config)
+        master.wait_window(dlg)
+        a = dlg.result
+    return VideoPlayer(master, path, title, method=method,
+                       infer_config=infer_config, analysis=a)

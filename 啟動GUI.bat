@@ -91,21 +91,29 @@ rem
 rem ---- Player (opens from the video list, or from an alarm entry) ----
 rem
 rem Built for LABELLING, not for watching. No audio on purpose.
+rem
+rem Opening a video ANALYSES IT FIRST, then plays. One pass over the clip
+rem produces the smoking marks and the skeleton keypoints together, so both
+rem are ready before the first frame shows. The result is cached next to the
+rem video under .analysis (the ORIGINAL FILE IS NEVER TOUCHED), so opening
+rem it a second time is instant instead of minutes.
+rem
 rem     play/pause, draggable seek bar, clock
 rem     frame step and 0.25x-2x, for checking the raise/hold/lower turns
-rem     "analyse" runs the detector over the whole clip ONCE and produces two
-rem       things: every alarm marked on the timeline in red (arrow buttons
-rem       jump between them), and the keypoints cached for the overlay
-rem     skeleton overlay, toggleable -- draws the cached keypoints, so it is
+rem     skeleton overlay, toggleable -- draws the CACHED keypoints, so it is
 rem       a table lookup and does NOT slow playback down
-rem     manual marks in yellow; snapshot to jpg with the frame number
+rem     the strip under the controls is the marker axis: every mark is a dot
+rem       you can click to jump straight there. Red = detected by the
+rem       analysis, yellow = you marked it. "re-analyse" runs the pass again.
+rem     snapshot to jpg, named with the frame number
 rem Keys: space, left/right = 5s, comma/period = one frame, N/P = next or
 rem previous mark, S = snapshot, M = mark, F = fullscreen, Esc = leave.
-rem The scan uses whichever method the detection tab has selected.
+rem The analysis uses whichever method the detection tab has selected.
 rem
-rem Playback runs at true 1x: the decode+draw time is subtracted from the
-rem frame wait. Measured 1.01x at 720p and 1080p, with or without the
-rem skeleton overlay.
+rem Playback holds true 1x by subtracting decode+draw time from the frame
+rem wait, and by dropping frames when it still cannot keep up. 60fps sources
+rem are the hard case (16.7ms per frame): 1080p60 measured 0.36x before that
+rem change and 1.04x after; 1080p30 is 1.01x. The overlay costs nothing.
 rem
 rem Downloaded files feed straight back in: pick one as the "source" on the
 rem detection tab.

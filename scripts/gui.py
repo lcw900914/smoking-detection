@@ -53,7 +53,7 @@ from inference.recorder import (DEFAULT_KEEP_DAYS,  # noqa: E402
                                 DEFAULT_SEGMENT_SEC, StreamRecorder,
                                 day_name, prune_days, site_slug)
 from inference.verifier import STATUS_NAMES  # noqa: E402
-from ui.player import VideoPlayer  # noqa: E402
+from ui.player import open_video  # noqa: E402
 from utils import load_config  # noqa: E402
 
 VIDEO_W, VIDEO_H = 800, 600
@@ -685,9 +685,9 @@ class DemoGUI:
             messagebox.showerror("找不到檔案", f"{path}\n可能已被移動或刪除。")
             self.refresh_dl_list()
             return
-        VideoPlayer(self.root, str(path), Path(path).name,
-                    method=self._current_method(),
-                    infer_config=self.infer_config)
+        open_video(self.root, str(path), Path(path).name,
+                   method=self._current_method(),
+                   infer_config=self.infer_config)
 
     def refresh_dl_list(self):
         """重掃資料夾、重建清單,縮圖交給背景執行緒解碼。
@@ -1414,10 +1414,10 @@ class DemoGUI:
                                 "警報片段還在錄製(觸發後續錄 4 秒),"
                                 "請稍候再點。")
             return
-        VideoPlayer(self.root, rec["path"],
-                    f"track {rec['tid']} 抽菸警報片段",
-                    method=self._current_method(),
-                    infer_config=self.infer_config)
+        open_video(self.root, rec["path"],
+                   f"track {rec['tid']} 抽菸警報片段",
+                   method=self._current_method(),
+                   infer_config=self.infer_config)
 
     def _draw_frame(self, bgr):
         # 依影像區「目前實際尺寸」縮放:拉大視窗畫面就跟著放大
