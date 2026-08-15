@@ -119,3 +119,43 @@ class TestSeekBarMapping:
         t_to_x, x_to_t = self._mk(duration=0.0)
         assert t_to_x(10.0) == 0
         assert x_to_t(250) == 0.0
+
+
+class TestNearestPose:
+    """骨架快取的查表:分析是每 N 幀做一次,播放要拿對那一組。"""
+
+    CACHE = {0: ["a"], 3: ["b"], 6: ["c"]}
+
+    def test_exact_sample_point(self):
+        from ui.player import nearest_pose
+        assert nearest_pose(self.CACHE, 3, 3) == ["b"]
+
+    def test_between_samples_looks_backwards(self):
+        """第 4、5 幀用第 3 幀的骨架。往回而不是四捨五入到最近的——
+        畫出來的必須是系統在那個時刻**已經看過**的東西,取後面那個
+        取樣點會讓骨架超前畫面。"""
+        from ui.player import nearest_pose
+        assert nearest_pose(self.CACHE, 4, 3) == ["b"]
+        assert nearest_pose(self.CACHE, 5, 3) == ["b"]
+
+    def test_falls_forward_when_nothing_behind(self):
+        """影片開頭可能還沒有取樣點,這時才退而用下一個。"""
+        from ui.player import nearest_pose
+        assert nearest_pose({3: ["b"]}, 1, 3) == ["b"]
+
+    def test_empty_cache(self):
+        from ui.player import nearest_pose
+        assert nearest_pose({}, 5, 3) is None
+
+    def test_gap_in_cache_returns_none(self):
+        """那一段沒偵測到人(沒有人 = 沒有關鍵點),不該亂借別處的骨架。"""
+        from ui.player import nearest_pose
+        assert nearest_pose({0: ["a"]}, 30, 3) is None
+
+    def test_stride_one_is_per_frame(self):
+        from ui.player import nearest_pose
+        assert nearest_pose({7: ["x"]}, 7, 1) == ["x"]
+
+    def test_zero_stride_does_not_divide_by_zero(self):
+        from ui.player import nearest_pose
+        assert nearest_pose({5: ["x"]}, 5, 0) == ["x"]

@@ -6,8 +6,11 @@
   轉折,正速看很難確認,慢速與逐幀才看得清楚
 - 骨架疊加(可開關):直接看見系統「看到的」腕-鼻幾何,誤判時一眼就知道
   是姿態估計錯了還是判定規則錯了
-- 抽菸掃描 + 時間軸標記:整支跑一次判定,把警報位置畫在進度條上,按
-  ◀▶ 直接跳過去——不必自己從頭拉到尾找
+- 「分析影片」一次算好:整支跑一次判定,**同時**收下警報位置與逐取樣點的
+  關鍵點。警報畫成時間軸紅點,按 ◀▶ 直接跳過去;骨架則進快取,播放時
+  只是查表畫線(約 1ms)。
+  早期版本是播放時每幀重跑偵測(約 27ms),1.0x 只跑得到 0.84x——而那趟
+  分析本來就已經算過同樣的東西,不留下來等於白算。
 - 截圖:把某一幀存下來當證據或論文插圖,檔名帶幀號可以再對回來
 
 **沒有音訊**:畫面是 OpenCV 逐幀解碼的。要聲音得換播放核心
@@ -54,6 +57,21 @@ def next_marker(marks: List[float], now: float,
         return later[0] if later else None
     earlier = [t for t in ordered if t < now - 0.25]
     return earlier[-1] if earlier else None
+
+
+def nearest_pose(cache: dict, idx: int, stride: int):
+    """取第 idx 幀該用的骨架:往回找最近一個有資料的取樣點。
+
+    分析是照管線的取樣率做的(30fps 的片子預設每 3 幀一次),不是每一幀
+    都有。往回找而不是四捨五入到最近的:**畫出來的必須是系統在那個時刻
+    已經看過的東西**,取用「還沒發生」的後一個取樣點會讓骨架超前畫面。
+    往回沒有時才退而用下一個(影片開頭那幾幀)。
+    """
+    if not cache:
+        return None
+    stride = max(1, stride)
+    base = (idx // stride) * stride
+    return cache.get(base) or cache.get(base + stride)
 
 
 def frame_delay_ms(fps: float, speed: float) -> int:
@@ -148,14 +166,18 @@ class VideoPlayer(tk.Toplevel):
         self.speed = 1.0
         self.loop = tk.BooleanVar(value=True)
         self.pose_on = tk.BooleanVar(value=False)
-        self._detector = None
-        self._detector_loading = False
+        # 姿態快取:幀號 → 該幀所有人的關鍵點。由「分析影片」那一趟
+        # 順便建好——那一趟本來就在跑姿態偵測,不留下來等於白算。
+        # 播放時只是查表畫線(約 1ms),不再每幀重跑偵測(約 27ms)。
+        self.pose_cache = {}
+        self._pose_stride = 1
         self._frame = None            # 目前這一幀(原始 BGR,截圖用)
         self._photo = None            # 防 GC
         self._alive = True
         self._scan_thread = None
         self._scan_cancel = threading.Event()
         self._scan_q: Queue = Queue()
+        self._frame_idx = 0
         self._next_at = time.perf_counter()   # 下一幀該出現的時刻
         self._last_bar_draw = 0.0
 
@@ -218,7 +240,7 @@ class VideoPlayer(tk.Toplevel):
 
         row2 = ttk.Frame(self, padding=(6, 0))
         row2.pack(fill="x", pady=(0, 4))
-        self.scan_btn = ttk.Button(row2, text="🔍 掃描抽菸",
+        self.scan_btn = ttk.Button(row2, text="🔍 分析影片",
                                    command=self.toggle_scan)
         self.scan_btn.pack(side="left")
         ttk.Button(row2, text="◀ 標記",
@@ -296,7 +318,8 @@ class VideoPlayer(tk.Toplevel):
         if not ok:
             return False
         self._frame = frame
-        self._render(frame)
+        self._frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        self._render(frame, self._frame_idx)
         # 進度條與時間只更新到約 10 Hz。redraw() 會 delete("all") 再重畫
         # 所有標記,每幀都做在大視窗下就吃掉可觀的時間,而人眼根本看不出
         # 進度條每秒動 30 次跟動 10 次的差別。
@@ -338,11 +361,13 @@ class VideoPlayer(tk.Toplevel):
     def redraw_current(self):
         """用目前這一幀重畫(不前進)。視窗縮放與切換骨架疊加時用。"""
         if self._alive and self._frame is not None:
-            self._render(self._frame)
+            self._render(self._frame, self._frame_idx)
 
-    def _render(self, frame):
-        if self.pose_on.get() and self._detector is not None:
-            frame = self._draw_pose(frame)
+    def _render(self, frame, idx: Optional[int] = None):
+        if self.pose_on.get() and self.pose_cache:
+            if idx is None:
+                idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            frame = self._draw_pose(frame, max(0, idx))
         cw = max(self.canvas.winfo_width(), 50)
         ch = max(self.canvas.winfo_height(), 50)
         h, w = frame.shape[:2]
@@ -356,38 +381,32 @@ class VideoPlayer(tk.Toplevel):
     # ---------- 骨架疊加 ----------
 
     def _toggle_pose(self):
-        """第一次開啟時才載入姿態模型(載入要好幾秒,不該在開窗時就付這個成本)。"""
-        if self._detector is not None or not self.pose_on.get():
-            self.redraw_current()      # 暫停時切換也要立刻看到差別
-            return
-        if self._detector_loading:
-            return
-        self._detector_loading = True
-        self.status.set("載入姿態模型中…")
+        """骨架疊加只吃快取,不做偵測——所以開關它不會讓播放變慢。"""
+        if self.pose_on.get() and not self.pose_cache:
+            self.status.set("還沒有骨架資料:請先按「分析影片」")
+        self.redraw_current()          # 暫停時切換也要立刻看到差別
 
-        def work():
-            try:
-                from tracking.pose_detector import PoseDetector
-                det = PoseDetector("yolov8s-pose.pt", 0.4, "auto")
-            except Exception as e:
-                self._scan_q.put(("error", f"姿態模型載入失敗:{e}"))
-                return
-            self._scan_q.put(("detector", det))
-        threading.Thread(target=work, daemon=True).start()
+    def _cached_pose(self, idx: int):
+        """取這一幀該用的骨架。
 
-    def _draw_pose(self, frame):
-        """疊加骨架。**每一幀都要重跑偵測(約 27ms)**,所以開著會比較慢:
-        1280×800 實測 1.0x 只跑得到 0.84x(0.5x 以下不受影響,因為那時
-        每幀的預算本來就夠)。這是刻意的取捨——要看清楚系統看到什麼,
-        就得付這個代價;不看的時候關掉即可。"""
+        分析是照管線的取樣率做的(預設 10fps,不是每一幀),所以往回找
+        最近一個有資料的取樣點。**這樣反而更誠實**:畫出來的就是系統
+        判定時真正看到的那一組關鍵點,不是另外補算的。
+        """
+        return nearest_pose(self.pose_cache, idx, self._pose_stride)
+
+    def _draw_pose(self, frame, idx: int):
+        """畫快取好的骨架。純繪圖(約 1ms),不做偵測,所以開著不影響速度。"""
+        kpts_list = self._cached_pose(idx)
+        if not kpts_list:
+            return frame
         from inference.skeleton import draw_skeleton
         vis = frame.copy()
-        try:
-            _boxes, kpts = self._detector.detect(frame)
-            for k in kpts:
+        for k in kpts_list:
+            try:
                 draw_skeleton(vis, k)
-        except Exception:
-            pass                      # 疊加失敗不該讓播放停掉
+            except Exception:
+                pass                  # 壞資料不該讓播放停掉
         return vis
 
     # ---------- 標記 ----------
@@ -413,17 +432,18 @@ class VideoPlayer(tk.Toplevel):
         self.seek_to(t)
         self.status.set(f"跳到 {format_time(t)}")
 
-    # ---------- 抽菸掃描 ----------
+    # ---------- 分析:抽菸標記 + 骨架快取 ----------
 
     def toggle_scan(self):
         if self._scan_thread is not None and self._scan_thread.is_alive():
             self._scan_cancel.set()
-            self.status.set("掃描取消中…")
+            self.status.set("分析取消中…")
             return
         self._scan_cancel.clear()
         self.bar.detected.clear()
-        self.scan_btn.config(text="■ 停止掃描")
-        self.status.set("掃描中…")
+        self.pose_cache.clear()
+        self.scan_btn.config(text="■ 停止分析")
+        self.status.set("分析中…")
         self._scan_thread = threading.Thread(target=self._scan, daemon=True)
         self._scan_thread.start()
 
@@ -458,7 +478,13 @@ class VideoPlayer(tk.Toplevel):
                     if not ok:
                         break
                     if i % step == 0:
-                        pipe.step(frame, i / self.fps)
+                        res = pipe.step(frame, i / self.fps)
+                        # 這一趟本來就跑了姿態偵測,關鍵點順手留下來給
+                        # 骨架疊加用——不留的話播放時就得每幀重跑一次
+                        kp = [r["kpts"] for r in res.values()
+                              if r.get("kpts") is not None]
+                        if kp:
+                            self._scan_q.put(("pose", (i, kp)))
                         if hits:
                             for t in hits:
                                 self._scan_q.put(("hit", t))
@@ -470,9 +496,10 @@ class VideoPlayer(tk.Toplevel):
             finally:
                 cap.release()
                 pipe.close()
+            self._scan_q.put(("stride", step))
             self._scan_q.put(("done", self._scan_cancel.is_set()))
         except Exception as e:
-            self._scan_q.put(("error", f"掃描失敗:{e}"))
+            self._scan_q.put(("error", f"分析失敗:{e}"))
 
     def _poll(self):
         """背景執行緒的結果一律在主執行緒消化(tkinter 非執行緒安全)。"""
@@ -486,23 +513,26 @@ class VideoPlayer(tk.Toplevel):
                     self.bar.redraw()
                 elif kind == "progress":
                     self.status.set(
-                        f"掃描中… {payload:.0%}"
-                        f"(已找到 {len(self.bar.detected)} 處)")
+                        f"分析中… {payload:.0%}"
+                        f"(抽菸 {len(self.bar.detected)} 處、"
+                        f"骨架 {len(self.pose_cache)} 幀)")
                 elif kind == "done":
-                    self.scan_btn.config(text="🔍 掃描抽菸")
+                    self.scan_btn.config(text="🔍 分析影片")
                     n = len(self.bar.detected)
                     self.status.set(
-                        ("掃描已取消。" if payload else "掃描完成。")
-                        + (f"找到 {n} 處,按「標記 ▶」逐一查看"
-                           if n else "沒有找到抽菸警報"))
-                elif kind == "detector":
-                    self._detector = payload
-                    self._detector_loading = False
-                    self.status.set("骨架疊加已開啟(每幀重跑偵測,會變慢)")
+                        ("分析已取消。" if payload else "分析完成。")
+                        + (f"找到 {n} 處抽菸,按「標記 ▶」逐一查看"
+                           if n else "沒有找到抽菸警報")
+                        + (f";骨架已備妥 {len(self.pose_cache)} 幀"
+                           if self.pose_cache else ""))
                     self.redraw_current()
+                elif kind == "pose":
+                    idx, kp = payload
+                    self.pose_cache[idx] = kp
+                elif kind == "stride":
+                    self._pose_stride = payload
                 elif kind == "error":
-                    self._detector_loading = False
-                    self.scan_btn.config(text="🔍 掃描抽菸")
+                    self.scan_btn.config(text="🔍 分析影片")
                     self.status.set(payload)
         except Empty:
             pass

@@ -93,18 +93,19 @@ rem
 rem Built for LABELLING, not for watching. No audio on purpose.
 rem     play/pause, draggable seek bar, clock
 rem     frame step and 0.25x-2x, for checking the raise/hold/lower turns
-rem     skeleton overlay, toggleable -- see what the system sees
-rem     "scan" runs the detector over the whole clip and marks every alarm
-rem       on the timeline in red; the arrow buttons jump between them
+rem     "analyse" runs the detector over the whole clip ONCE and produces two
+rem       things: every alarm marked on the timeline in red (arrow buttons
+rem       jump between them), and the keypoints cached for the overlay
+rem     skeleton overlay, toggleable -- draws the cached keypoints, so it is
+rem       a table lookup and does NOT slow playback down
 rem     manual marks in yellow; snapshot to jpg with the frame number
 rem Keys: space, left/right = 5s, comma/period = one frame, N/P = next or
 rem previous mark, S = snapshot, M = mark, F = fullscreen, Esc = leave.
 rem The scan uses whichever method the detection tab has selected.
 rem
 rem Playback runs at true 1x: the decode+draw time is subtracted from the
-rem frame wait. Turning the skeleton overlay ON re-runs detection on every
-rem frame (~27ms), so 1x drops to about 0.84x at a large window size --
-rem expected, not a fault. Slower speeds are unaffected.
+rem frame wait. Measured 1.01x at 720p and 1080p, with or without the
+rem skeleton overlay.
 rem
 rem Downloaded files feed straight back in: pick one as the "source" on the
 rem detection tab.
