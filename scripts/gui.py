@@ -233,6 +233,8 @@ class DemoGUI:
         self.dl_info = None
         self.dl_q: "queue.Queue" = queue.Queue()
         self.dl_prog_q: "queue.Queue" = queue.Queue()
+        self.dl_meta_q: "queue.Queue" = queue.Queue()
+        self._dl_scan = 0          # 換資料夾時作廢上一輪的縮圖解碼
         self._poll_id = None
 
         # 警報片段錄製:滾動保留最近 ~10 秒取樣影格(縮小節省記憶體),
@@ -655,16 +657,57 @@ class DemoGUI:
         self.dl_bar = ttk.Progressbar(f, maximum=1.0)
         self.dl_bar.grid(row=6, column=0, columnspan=4, sticky="ew", pady=2)
 
-        log_box = ttk.LabelFrame(f, text="下載記錄", padding=4)
-        log_box.grid(row=7, column=0, columnspan=4, sticky="nsew", pady=(6, 0))
+        list_box = ttk.LabelFrame(f, text="這個資料夾裡的影片(雙擊播放)",
+                                  padding=4)
+        list_box.grid(row=7, column=0, columnspan=4, sticky="nsew",
+                      pady=(6, 0))
         f.rowconfigure(7, weight=1)
-        self.dl_log = tk.Listbox(log_box, height=10)
-        self.dl_log.pack(fill="both", expand=True)
+        head = ttk.Frame(list_box)
+        head.pack(fill="x", pady=(0, 4))
+        ttk.Button(head, text="↻ 重新整理",
+                   command=self.refresh_dl_list).pack(side="left")
+        self.dl_count_lbl = ttk.Label(head, text="", foreground="#666666")
+        self.dl_count_lbl.pack(side="left", padx=8)
+        self.dl_list = VideoList(list_box, on_open=self._play_video)
+        self.dl_list.pack(fill="both", expand=True)
+        self.refresh_dl_list()
 
     def _browse_dl_dir(self):
         p = filedialog.askdirectory(title="選擇影片存放資料夾")
         if p:
             self.dl_dir_var.set(p)
+            self.refresh_dl_list()
+
+    def _play_video(self, path):
+        """雙擊或按播放:沿用警報片段那個回放視窗。"""
+        if not Path(path).exists():
+            messagebox.showerror("找不到檔案", f"{path}\n可能已被移動或刪除。")
+            self.refresh_dl_list()
+            return
+        ClipPlayer(self.root, str(path), Path(path).name)
+
+    def refresh_dl_list(self):
+        """重掃資料夾、重建清單,縮圖交給背景執行緒解碼。
+
+        解碼要開 VideoCapture 並 seek,檔案一多會卡住介面,所以放背景;
+        但 PhotoImage 只能在主執行緒建,背景只回傳 numpy 陣列。
+        """
+        folder = self.dl_dir_var.get().strip() or DEFAULT_OUT_DIR
+        files = list_videos(folder)
+        self.dl_count_lbl.config(
+            text=f"{len(files)} 部影片　{folder}")
+        pending = self.dl_list.set_files(files)
+        if not pending:
+            return
+        self._dl_scan += 1
+        scan = self._dl_scan
+
+        def work():
+            for p in pending:
+                if scan != self._dl_scan:
+                    return          # 使用者又換了資料夾,這輪的結果作廢
+                self.dl_meta_q.put(video_meta(p))
+        threading.Thread(target=work, daemon=True).start()
 
     def _open_dl_folder(self):
         d = Path(self.dl_dir_var.get().strip() or DEFAULT_OUT_DIR)
@@ -1196,11 +1239,21 @@ class DemoGUI:
 
         # 下載分頁:訊息全收,進度只取最新一筆(短時間內會湧入上百筆,
         # 每一筆都寫進度條是白做工,畫面也只看得到最後一筆)
+        msg = None
         try:
             while True:
-                self.dl_log.insert(0, self.dl_q.get_nowait())
-                if self.dl_log.size() > 300:
-                    self.dl_log.delete(300, tk.END)
+                msg = self.dl_q.get_nowait()
+        except queue.Empty:
+            pass
+        if msg is not None:
+            # 記錄改成縮圖清單之後,訊息(尤其錯誤)改走狀態列,
+            # 不然使用者完全不知道發生什麼事
+            self.dl_status_var.set(msg)
+            if msg.startswith("[完成]") or msg.startswith("[錯誤]"):
+                self.refresh_dl_list()
+        try:
+            while True:
+                self.dl_list.apply_meta(self.dl_meta_q.get_nowait())
         except queue.Empty:
             pass
         latest = None
@@ -1399,6 +1452,139 @@ class DetailWindow(tk.Toplevel):
         box.configure(state="disabled")   # 只讀,但仍可選取複製
         self.attributes("-topmost", True)
         self.after(500, lambda: self.attributes("-topmost", False))
+
+
+VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".ts")
+THUMB_W, THUMB_H = 160, 90
+
+
+def list_videos(folder) -> list:
+    """資料夾裡的影片檔,最新的排前面。"""
+    d = Path(folder)
+    if not d.is_dir():
+        return []
+    files = [p for p in d.iterdir()
+             if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def video_meta(path: Path) -> dict:
+    """縮圖 + 長度 + 尺寸。縮圖取 10% 位置的那一幀。
+
+    不取第 0 幀:很多影片開頭是黑畫面或版權卡,整排縮圖會全黑,
+    等於沒有縮圖。
+    """
+    meta = {"path": path, "thumb": None, "seconds": 0.0, "size": 0}
+    try:
+        meta["size"] = path.stat().st_size
+    except OSError:
+        pass
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            return meta
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        n = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+        if fps > 0 and n > 0:
+            meta["seconds"] = n / fps
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(n * 0.1))
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            h, w = frame.shape[:2]
+            s = min(THUMB_W / w, THUMB_H / h)
+            small = cv2.resize(frame, (max(1, int(w * s)),
+                                       max(1, int(h * s))))
+            meta["thumb"] = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    except Exception:
+        pass                       # 壞檔就只是沒有縮圖,不該讓清單掛掉
+    finally:
+        cap.release()
+    return meta
+
+
+class VideoList(ttk.Frame):
+    """可捲動的影片縮圖清單,雙擊播放。
+
+    縮圖解碼放在背景執行緒(每個檔案要開一次 VideoCapture,檔案一多會
+    卡住介面),但 PhotoImage 一定要在主執行緒建立——tkinter 的物件不能
+    跨執行緒建,所以背景只回傳 numpy 陣列,由 _poll_ui 收進來再轉。
+    """
+
+    def __init__(self, parent, on_open, height: int = 300):
+        super().__init__(parent)
+        self.on_open = on_open
+        canvas = tk.Canvas(self, height=height, highlightthickness=0)
+        bar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        self.inner = ttk.Frame(canvas)
+        self.inner.bind(
+            "<Configure>",
+            lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._win = canvas.create_window((0, 0), window=self.inner,
+                                         anchor="nw")
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(self._win, width=e.width))
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.bind_all("<MouseWheel>", self._wheel)
+        self.canvas = canvas
+        self._rows = {}            # path -> (frame, thumb_label)
+        self._photos = {}          # path -> PhotoImage(防 GC)
+        self.empty = ttk.Label(self.inner, text="(這個資料夾還沒有影片)",
+                               foreground="#888888")
+        self.empty.pack(anchor="w", padx=8, pady=8)
+
+    def _wheel(self, event):
+        try:
+            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+        except tk.TclError:
+            pass
+
+    def set_files(self, files: list) -> list:
+        """重建清單(縮圖先留白),回傳還需要解碼縮圖的檔案。"""
+        for row, _thumb, _meta in self._rows.values():
+            row.destroy()
+        self._rows.clear()
+        self.empty.pack_forget()
+        if not files:
+            self.empty.pack(anchor="w", padx=8, pady=8)
+            return []
+        for p in files:
+            row = ttk.Frame(self.inner, padding=3)
+            row.pack(fill="x")
+            thumb = tk.Label(row, width=THUMB_W, height=THUMB_H,
+                             background="#333333", cursor="hand2")
+            thumb.pack(side="left")
+            info = ttk.Frame(row)
+            info.pack(side="left", fill="x", expand=True, padx=8)
+            ttk.Label(info, text=p.name, anchor="w",
+                      wraplength=560, justify="left").pack(anchor="w")
+            meta_lbl = ttk.Label(info, text="讀取中…", foreground="#666666")
+            meta_lbl.pack(anchor="w")
+            ttk.Button(row, text="▶ 播放",
+                       command=lambda q=p: self.on_open(q)).pack(side="right")
+            for w in (row, thumb, info):
+                w.bind("<Double-Button-1>", lambda _e, q=p: self.on_open(q))
+            self._rows[p] = (row, thumb, meta_lbl)
+        return list(files)
+
+    def apply_meta(self, meta: dict) -> None:
+        """把背景解碼好的縮圖與資訊放上去(主執行緒呼叫)。"""
+        item = self._rows.get(meta["path"])
+        if item is None:
+            return
+        _row, thumb, meta_lbl = item
+        if meta.get("thumb") is not None:
+            photo = ImageTk.PhotoImage(Image.fromarray(meta["thumb"]))
+            self._photos[meta["path"]] = photo      # 保留參照,否則被 GC
+            thumb.configure(image=photo, width=THUMB_W, height=THUMB_H)
+        secs, size = meta.get("seconds", 0), meta.get("size", 0)
+        parts = []
+        if secs:
+            parts.append(f"{int(secs) // 60}:{int(secs) % 60:02d}")
+        if size:
+            parts.append(f"{size / 2**20:.1f} MB")
+        meta_lbl.config(text="  ".join(parts) or "(無法讀取)")
 
 
 class ClipPlayer(tk.Toplevel):

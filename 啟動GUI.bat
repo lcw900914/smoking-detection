@@ -83,6 +83,11 @@ rem 720p and above needs audio+video muxing (modern YouTube only ships 360p
 rem pre-muxed; higher is DASH with separate streams). The ffmpeg used for that
 rem is the one bundled with imageio-ffmpeg, so nothing extra to install.
 rem
+rem The lower half is not a text log -- it is the folder's video list, with a
+rem thumbnail, length and size per file. Double-click (or hit Play) to watch
+rem one in a window; the list refreshes itself when a download finishes.
+rem Messages and errors go to the status line next to the buttons.
+rem
 rem Downloaded files feed straight back in: pick one as the "source" on the
 rem detection tab.
 rem

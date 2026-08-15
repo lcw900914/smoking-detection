@@ -158,3 +158,73 @@ class TestTriageOverall:
                 cols = gui.triage(track(tid=1, presence=presence,
                                         alarm=alarm))
                 assert any(ids(c) for c in cols), (presence, alarm)
+
+
+class TestVideoListing:
+    """影片下載分頁的縮圖清單:掃資料夾與讀縮圖。
+
+    影片用臨時檔現做,不吃 demo_videos/ —— 那個目錄在 .gitignore 裡,
+    測試不該依賴一份新 clone 拿不到的東西。
+    """
+
+    def _make(self, path, frames=20, fps=10.0, size=(64, 48)):
+        import cv2
+        import numpy as np
+        vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"),
+                             fps, size)
+        for i in range(frames):
+            vw.write(np.full((size[1], size[0], 3), (i * 10) % 255, np.uint8))
+        vw.release()
+        return path
+
+    def test_lists_only_video_files(self, tmp_path):
+        self._make(tmp_path / "a.avi")
+        (tmp_path / "notes.txt").write_text("x")
+        (tmp_path / "cover.jpg").write_bytes(b"x")
+        (tmp_path / "sub").mkdir()
+        got = gui.list_videos(tmp_path)
+        assert [p.name for p in got] == ["a.avi"]
+
+    def test_newest_first(self, tmp_path):
+        import os
+        import time
+        for name in ("old.avi", "new.avi"):
+            self._make(tmp_path / name)
+        os.utime(tmp_path / "old.avi", (time.time() - 999, time.time() - 999))
+        assert [p.name for p in gui.list_videos(tmp_path)] == ["new.avi",
+                                                               "old.avi"]
+
+    def test_missing_folder_is_empty_not_an_error(self, tmp_path):
+        assert gui.list_videos(tmp_path / "還沒建立") == []
+
+    def test_meta_has_thumbnail_duration_and_size(self, tmp_path):
+        p = self._make(tmp_path / "clip.avi", frames=20, fps=10.0)
+        meta = gui.video_meta(p)
+        assert meta["thumb"] is not None
+        assert meta["thumb"].shape[2] == 3          # RGB,給 PIL 用
+        assert meta["thumb"].shape[0] <= gui.THUMB_H
+        assert meta["thumb"].shape[1] <= gui.THUMB_W
+        assert meta["seconds"] == pytest.approx(2.0, abs=0.3)
+        assert meta["size"] > 0
+
+    def test_broken_file_does_not_raise(self, tmp_path):
+        """壞檔只是沒有縮圖,不該讓整份清單掛掉。"""
+        bad = tmp_path / "broken.mp4"
+        bad.write_bytes(b"not a video")
+        meta = gui.video_meta(bad)
+        assert meta["thumb"] is None
+        assert meta["size"] > 0
+
+    def test_thumbnail_is_not_the_first_frame(self, tmp_path):
+        """取 10% 的位置:很多影片開頭是黑畫面或版權卡,
+        取第 0 幀會整排縮圖全黑,等於沒有縮圖。"""
+        import cv2
+        import numpy as np
+        p = tmp_path / "dark_start.avi"
+        vw = cv2.VideoWriter(str(p), cv2.VideoWriter_fourcc(*"MJPG"),
+                             10.0, (64, 48))
+        for i in range(40):
+            val = 0 if i < 2 else 200                # 開頭兩幀全黑
+            vw.write(np.full((48, 64, 3), val, np.uint8))
+        vw.release()
+        assert gui.video_meta(p)["thumb"].mean() > 50
