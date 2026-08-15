@@ -22,12 +22,14 @@ rem The main screen carries only four switches -- smoking alarm, wandering
 rem alarm, waiting alarm, skeleton overlay. Every threshold lives in the
 rem method's parameter sheet instead.
 rem
-rem WORTH KNOWING: red markers point at the START of the evidence -- the
-rem hand-raise that led to the first counted event -- not at the moment the
-rem alarm fired. The alarm is a conclusion ("enough events, P held above the
-rem threshold"), measured 11.7s after the raise on the demo clip. Alarm clips
-rem keep alarm.clip_pre_sec seconds before the trigger (default 10), so a long
-rem lead-in can start before the clip does; the log says so when it happens.
+rem WORTH KNOWING: red markers point at the FIRST SUSPECTED hand-to-face,
+rem not at the moment the alarm fired. The alarm is a conclusion ("enough
+rem events, P held above the threshold") and ran 25s later on the demo clip.
+rem Brief touches that were too short to count still count as suspicion: once
+rem smoking is confirmed, those are where the behaviour started. Alarm clips
+rem keep alarm.clip_pre_sec seconds before the trigger (default 10), which is
+rem shorter than a typical lead-in -- the log says so when the clip misses
+rem the start, so it does not look like a missed detection.
 rem
 rem Smoking analysis only RUNS for people in the WAITING
 rem state. Everyone else is skipped outright -- no ROI crop, no appearance

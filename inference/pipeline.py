@@ -20,7 +20,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Deque, Dict, Optional
 
 import cv2
 import numpy as np
@@ -68,7 +68,7 @@ class TrackState:
     wander_notified: bool = False     # 徘徊已通報(每個 track 只報一次)
     wait_notified: bool = False       # 等待已通報(同上)
     wait_gate_logged: bool = False    # 「型態不符」只提示一次
-    last_raise_t: Optional[float] = None    # 最近一次「舉手」的時刻
+    raises: Deque[float] = field(default_factory=deque)  # 視窗內的抬手時刻
     evidence_start_t: Optional[float] = None  # 本輪證據的起點(第一次抬手)
     skeleton: Optional[SkeletonStageEstimator] = None
     loiter: Optional[LoiterDetector] = None
@@ -108,19 +108,26 @@ class TrackState:
 
 def mark_evidence(st: "TrackState", had: int, counted: bool,
                   timestamp: float) -> None:
-    """把證據起點釘在促成第一次計入事件的那次抬手上。
+    """把證據起點釘在**第一次抬手**上——最早的疑似時刻。
 
     標記軸與警報訊息都指向這裡,而不是警報成立的時刻。觸發是「累積夠
     min_events 次、且 P 持續超過門檻」的結論,可能落在動作開始後十幾二十
     秒——點過去只會看到人站著,要看的東西早就過去了。
 
+    用的是視窗內**最早**的那次抬手,不是促成計入的那一次。太短而沒被計入
+    的抬手(碰一下臉、扶眼鏡)照樣算疑似:確定是抽菸之後回頭看,那些就是
+    這輪行為的開頭,使用者要跳到的正是那裡。``raises`` 已經修剪成與次數
+    視窗同寬,所以標記不會指到與這次警報無關的陳年動作。
+
+    取 ``min`` 而不是隊首:手到臉的起點是事件結算時回填的(結束 − 停留),
+    可能早於已經存進去的 S1,順序不保證。
+
     只釘第一次(``had == 0``):後續幾口是同一輪證據,起點不該往後跑。
-    ``last_raise_t`` 為 None 表示這次計入沒有前導的 S1(例如手已經舉著才
-    進畫面),退回用當下時刻,總比沒有標記好。
+    ``raises`` 空的表示沒看到前導 S1(例如手已經舉著才進畫面),退回用
+    當下時刻,總比沒有標記好。
     """
     if counted and had == 0 and st.evidence_start_t is None:
-        raise_t = st.last_raise_t
-        st.evidence_start_t = timestamp if raise_t is None else raise_t
+        st.evidence_start_t = min(st.raises) if st.raises else timestamp
 
 
 class SmokingDetectionPipeline:
@@ -208,6 +215,8 @@ class SmokingDetectionPipeline:
         # 手部擺動很像手到嘴。這比移動排除嚴格——移動排除看的是 10 秒內
         # 的位移,一個剛進畫面、型態還在「判定中」的人只要當下沒走動就
         # 攔不住;這一條看的是在場型態本身。
+        self.esc_window = float(
+            self.cfg.get("escalation", {}).get("window_sec", 90.0))
         self.smoking_requires_waiting = bool(
             self.presence_cfg.get("smoking_requires_waiting", True))
         self.on_presence = None   # (track_id, 在場秒數, 累積路徑)
@@ -412,16 +421,28 @@ class SmokingDetectionPipeline:
                 st.last_dnorm = d
                 st.ori_hist.append((timestamp, ori))
                 st.state_machine.push(stage, timestamp)
+                # 修剪成與次數視窗同寬:警報只看得到這段時間內的事件,
+                # 標記也不該指到視窗外、與這次警報無關的動作。不能只砍
+                # 隊首——事件起點是回填的,可能早於已存的 S1
+                if st.raises and timestamp - min(st.raises) > self.esc_window:
+                    st.raises = deque(x for x in st.raises
+                                      if timestamp - x <= self.esc_window)
                 # 移動排除開啟且移動中:不計手到嘴事件(走動時手部
                 # 擺動易誤判;餵背景讓進行中的停留正常結算)
                 excluded = self.move_gate_enabled and st.moving
-                if stage == 0:          # S1 舉手
-                    st.last_raise_t = timestamp
+                if stage == 0:          # S1 舉手(見下方註解:常常抓不到)
+                    st.raises.append(timestamp)
                 had = st.counter.count()
                 episode = st.counter.update(3 if excluded else stage,
                                             timestamp)
                 if episode is not None:
                     dwell, counted, reason = episode
+                    # 手到臉的起點。S1 只在一個很窄的距離帶內才回報
+                    # (near_eff < d < near_eff + 2×move),10fps 取樣下手
+                    # 常常一步就跨過去,只靠 stage==0 會整輪抓不到半個。
+                    # 事件結算一定有,所以用「結束 − 停留」當可靠錨點;
+                    # 不論計不計入都記,太短的碰臉照樣是疑似時刻。
+                    st.raises.append(timestamp - dwell)
                     mark_evidence(st, had, counted, timestamp)
                     if self.on_event is not None:
                         self.on_event(tid, dwell, counted, reason)
