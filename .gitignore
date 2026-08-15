@@ -22,3 +22,9 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+
+# 執行期日誌(啟動GUI.bat 把 stderr 導到這裡)
+logs/
+
+# 直播錄影(每天數十 GB)
+recordings/
