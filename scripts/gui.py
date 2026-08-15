@@ -1193,6 +1193,30 @@ class DemoGUI:
         elif time.time() - self._rec_status_t >= 2.0:
             self._rec_status_t = time.time()
             self._refresh_rec_status()
+
+        # 下載分頁:訊息全收,進度只取最新一筆(短時間內會湧入上百筆,
+        # 每一筆都寫進度條是白做工,畫面也只看得到最後一筆)
+        try:
+            while True:
+                self.dl_log.insert(0, self.dl_q.get_nowait())
+                if self.dl_log.size() > 300:
+                    self.dl_log.delete(300, tk.END)
+        except queue.Empty:
+            pass
+        latest = None
+        try:
+            while True:
+                latest = self.dl_prog_q.get_nowait()
+        except queue.Empty:
+            pass
+        if latest is not None:
+            self.dl_bar["value"] = latest.get("frac", 0.0)
+            self.dl_status_var.set(latest.get("text", ""))
+        # 下載執行緒結束後由主執行緒復原按鈕(同 start_download 的說明)
+        if self.downloader is None and str(self.dl_cancel_btn["state"]) != \
+                "disabled":
+            self._reset_dl_buttons()
+
         # 記住排程 id:關視窗時要取消,否則 destroy 之後那個 callback 還會
         # 觸發一次,在主控台留下 invalid command name "..._poll_ui"
         self._poll_id = self.root.after(30, self._poll_ui)
