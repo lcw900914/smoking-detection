@@ -84,9 +84,22 @@ rem pre-muxed; higher is DASH with separate streams). The ffmpeg used for that
 rem is the one bundled with imageio-ffmpeg, so nothing extra to install.
 rem
 rem The lower half is not a text log -- it is the folder's video list, with a
-rem thumbnail, length and size per file. Double-click (or hit Play) to watch
-rem one in a window; the list refreshes itself when a download finishes.
+rem thumbnail, length and size per file. Double-click (or hit Play) to open it
+rem in the player; the list refreshes itself when a download finishes.
 rem Messages and errors go to the status line next to the buttons.
+rem
+rem ---- Player (opens from the video list, or from an alarm entry) ----
+rem
+rem Built for LABELLING, not for watching. No audio on purpose.
+rem     play/pause, draggable seek bar, clock
+rem     frame step and 0.25x-2x, for checking the raise/hold/lower turns
+rem     skeleton overlay, toggleable -- see what the system sees
+rem     "scan" runs the detector over the whole clip and marks every alarm
+rem       on the timeline in red; the arrow buttons jump between them
+rem     manual marks in yellow; snapshot to jpg with the frame number
+rem Keys: space, left/right = 5s, comma/period = one frame, N/P = next or
+rem previous mark, S = snapshot, M = mark, F = fullscreen, Esc = leave.
+rem The scan uses whichever method the detection tab has selected.
 rem
 rem Downloaded files feed straight back in: pick one as the "source" on the
 rem detection tab.

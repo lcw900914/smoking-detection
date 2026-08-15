@@ -53,6 +53,7 @@ from inference.recorder import (DEFAULT_KEEP_DAYS,  # noqa: E402
                                 DEFAULT_SEGMENT_SEC, StreamRecorder,
                                 day_name, prune_days, site_slug)
 from inference.verifier import STATUS_NAMES  # noqa: E402
+from ui.player import VideoPlayer  # noqa: E402
 from utils import load_config  # noqa: E402
 
 VIDEO_W, VIDEO_H = 800, 600
@@ -684,7 +685,9 @@ class DemoGUI:
             messagebox.showerror("找不到檔案", f"{path}\n可能已被移動或刪除。")
             self.refresh_dl_list()
             return
-        ClipPlayer(self.root, str(path), Path(path).name)
+        VideoPlayer(self.root, str(path), Path(path).name,
+                    method=self._current_method(),
+                    infer_config=self.infer_config)
 
     def refresh_dl_list(self):
         """重掃資料夾、重建清單,縮圖交給背景執行緒解碼。
@@ -1411,8 +1414,10 @@ class DemoGUI:
                                 "警報片段還在錄製(觸發後續錄 4 秒),"
                                 "請稍候再點。")
             return
-        ClipPlayer(self.root, rec["path"],
-                   f"track {rec['tid']} 抽菸警報片段")
+        VideoPlayer(self.root, rec["path"],
+                    f"track {rec['tid']} 抽菸警報片段",
+                    method=self._current_method(),
+                    infer_config=self.infer_config)
 
     def _draw_frame(self, bgr):
         # 依影像區「目前實際尺寸」縮放:拉大視窗畫面就跟著放大
@@ -1585,67 +1590,6 @@ class VideoList(ttk.Frame):
         if size:
             parts.append(f"{size / 2**20:.1f} MB")
         meta_lbl.config(text="  ".join(parts) or "(無法讀取)")
-
-
-class ClipPlayer(tk.Toplevel):
-    """警報片段回放視窗:循環播放 mp4,畫面隨視窗縮放。"""
-
-    def __init__(self, master, path: str, title: str):
-        super().__init__(master)
-        self.title(title)
-        self.cap = cv2.VideoCapture(path)
-        fps = self.cap.get(cv2.CAP_PROP_FPS) or 10.0
-        self.delay = max(30, int(1000 / fps))
-
-        # 初始尺寸:片源解析度,上限 800 寬(之後可自由拉大縮小)
-        src_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
-        src_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
-        s = min(1.0, 800 / max(1, src_w))
-        self._init_w, self._init_h = int(src_w * s), int(src_h * s)
-
-        # 用 Canvas:要求尺寸固定為初始值,實際顯示依視窗現況縮放
-        # (Label 會把放大後的圖變成新的最小尺寸,無法縮回)
-        self.canvas = tk.Canvas(self, background="#111111",
-                                width=self._init_w, height=self._init_h,
-                                highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self._item = self.canvas.create_image(
-            self._init_w // 2, self._init_h // 2, anchor="center")
-
-        self.protocol("WM_DELETE_WINDOW", self._close)
-        self._alive = True
-        self.attributes("-topmost", True)
-        self.after(500, lambda: self.attributes("-topmost", False))
-        self._tick()
-
-    def _tick(self):
-        if not self._alive:
-            return
-        ok, frame = self.cap.read()
-        if not ok:  # 播完 → 從頭循環
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ok, frame = self.cap.read()
-            if not ok:
-                self._close()
-                return
-        # 依視窗目前實際尺寸等比縮放(拉大視窗畫面跟著放大)
-        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if cw < 50 or ch < 50:
-            cw, ch = self._init_w, self._init_h
-        h, w = frame.shape[:2]
-        s = min(cw / w, ch / h)
-        frame = cv2.resize(frame, (max(1, int(w * s)), max(1, int(h * s))))
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.canvas.coords(self._item, cw // 2, ch // 2)
-        self.canvas.itemconfigure(self._item, image=photo)
-        self.canvas.image = photo
-        self.after(self.delay, self._tick)
-
-    def _close(self):
-        self._alive = False
-        self.cap.release()
-        self.destroy()
 
 
 def _enable_dpi_awareness():
