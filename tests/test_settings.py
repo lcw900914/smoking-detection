@@ -21,7 +21,8 @@ CFG = {
               "clip_overlay": False},
     "skeleton": {"near_ratio": 0.9, "move_ratio": 0.35, "min_scale_px": 24,
                  "rise_margin": 0.5},
-    "move_gate": {"max_heights": 3.0, "window_sec": 10.0},
+    "move_gate": {"enabled": True, "max_heights": 3.0,
+                  "window_sec": 10.0},
     "state_machine": {"weights": {"state_machine": 0.4, "network": 0.6}},
     "verify": {"min_smoking": 0.25, "min_valid_ratio": 0.15,
                "min_span_sec": 3.0, "window_sec": 90.0},
@@ -182,3 +183,22 @@ class TestBooleanParam:
     def test_shows_for_every_method(self):
         for m in reg.METHODS:
             assert "alarm.clip_overlay" in defaults_for(CFG, m), m.key
+
+
+class TestMoveGateSwitch:
+    """移動排除決定「經過/徘徊的人會不會被判抽菸」,一定要關得掉。
+
+    先前主畫面有這個勾選框,改版時被移除卻沒補進參數表——行為沒變,
+    但使用者失去了唯一的開關,看起來就像規則壞掉。
+    """
+
+    def test_is_adjustable(self):
+        assert "move_gate.enabled" in defaults_for(CFG, reg.get("rule"))
+
+    def test_can_be_turned_off(self):
+        out = apply_overrides(CFG, {"move_gate.enabled": 0})
+        assert out["move_gate"]["enabled"] is False
+
+    def test_shows_for_every_method(self):
+        for m in reg.METHODS:
+            assert "move_gate.enabled" in defaults_for(CFG, m), m.key

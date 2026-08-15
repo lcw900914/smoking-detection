@@ -20,7 +20,13 @@ rem ---- Live detection tab ----
 rem
 rem The main screen carries only four switches -- smoking alarm, wandering
 rem alarm, waiting alarm, skeleton overlay. Every threshold lives in the
-rem method's parameter sheet instead. They used to be settable in both
+rem method's parameter sheet instead.
+rem
+rem WORTH KNOWING: the sheet's "movement gating" is ON by default, and it
+rem blocks smoking alarms for anyone who is walking (arm swing looks like
+rem hand-to-mouth). The visible effect is that PASSING and WANDERING people
+rem are practically never flagged -- only people who have stopped. Turn it
+rem off in the sheet if you need to catch smoking on the move. They used to be settable in both
 rem places, and the main screen overwrote the sheet right after startup, so
 rem the sheet silently did nothing.
 rem
