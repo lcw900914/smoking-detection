@@ -54,6 +54,9 @@ from inference.recorder import (DEFAULT_KEEP_DAYS,  # noqa: E402
                                 day_name, prune_days, site_slug)
 from inference.verifier import STATUS_NAMES  # noqa: E402
 from ui.player import open_video  # noqa: E402
+from ui.settings import (apply_overrides, diff_from,  # noqa: E402
+                         load_overrides, save_overrides)
+from ui.settings_dialog import SettingsDialog  # noqa: E402
 from utils import load_config  # noqa: E402
 
 VIDEO_W, VIDEO_H = 800, 600
@@ -237,6 +240,9 @@ class DemoGUI:
         self.dl_meta_q: "queue.Queue" = queue.Queue()
         self._dl_scan = 0          # 換資料夾時作廢上一輪的縮圖解碼
         self._poll_id = None
+        # 每個方法各記各的參數覆寫(見 ui/settings.py):論文要橫向比較,
+        # 調鬆 rule 不該連帶改到 hybrid
+        self.overrides = load_overrides()
 
         # 警報片段錄製:滾動保留最近 ~10 秒取樣影格(縮小節省記憶體),
         # 警報觸發時連同後續 4 秒寫成 mp4,供記錄點擊回放
@@ -426,9 +432,11 @@ class DemoGUI:
             values=[self._method_label(m) for m in methods_registry.METHODS])
         self.method_box.pack(side="left", padx=4)
         self.method_box.bind("<<ComboboxSelected>>",
-                             lambda _e: self._on_method_change())
+                             lambda _e: self._on_method_change(ask=True))
+        ttk.Button(mrow, text="⚙ 參數", width=8,
+                   command=self.edit_settings).pack(side="left", padx=4)
         self.method_desc = ttk.Label(mrow, text="", foreground="#555555",
-                                     wraplength=760, justify="left")
+                                     wraplength=700, justify="left")
         self.method_desc.pack(side="left", padx=8, fill="x", expand=True)
 
         row1 = ttk.Frame(ctrl)
@@ -687,7 +695,9 @@ class DemoGUI:
             return
         open_video(self.root, str(path), Path(path).name,
                    method=self._current_method(),
-                   infer_config=self.infer_config)
+                   infer_config=self.infer_config,
+                   overrides=self.overrides.get(
+                       self._current_method().key, {}))
 
     def refresh_dl_list(self):
         """重掃資料夾、重建清單,縮圖交給背景執行緒解碼。
@@ -935,16 +945,55 @@ class DemoGUI:
                 return m
         return methods_registry.default()
 
-    def _on_method_change(self):
-        """切換方法:更新說明文字,並開關「權重」欄。"""
+    def _on_method_change(self, ask: bool = False):
+        """切換方法:更新說明文字、開關「權重」欄,並跳出參數視窗。
+
+        使用者要求「選擇此檢測方法時要讓我設定」——每個方法的門檻本來就
+        該分開調,切過去時直接問是最不容易忘的時機。啟動時的初始化不問
+        (ask=False),不然一開視窗就被彈窗擋住。
+        """
         m = self._current_method()
-        tag = "判定不含學習權重" if m.ai_free_decision else "含學習權重"
-        self.method_desc.config(text=f"[{m.key} / {tag}] {m.desc}")
+        self._update_method_desc()
         state = "normal" if m.needs_appearance else "disabled"
         for w in (self.ckpt_entry, self.ckpt_btn):
             w.config(state=state)
         self.ckpt_label.config(
             text="權重" if m.needs_appearance else "權重(此方法不需)")
+        if ask:
+            self.edit_settings()
+
+    def current_config(self) -> dict:
+        """目前生效的推理設定(設定檔 + 這個方法的覆寫)。
+
+        即時偵測與影片分析都走這裡,兩邊才會是同一組門檻——先前分析是
+        自己重讀設定檔的,畫面上調好的值它吃不到。
+        """
+        return apply_overrides(load_config(self.infer_config),
+                               self.overrides.get(self._current_method().key,
+                                                  {}))
+
+    def edit_settings(self):
+        """開啟這個方法的參數視窗。"""
+        m = self._current_method()
+        base = load_config(self.infer_config)
+        dlg = SettingsDialog(self.root, m, base,
+                             self.overrides.get(m.key, {}))
+        self.root.wait_window(dlg)
+        if dlg.result is None:
+            return                      # 取消
+        self.overrides[m.key] = dlg.result
+        save_overrides(self.overrides)
+        self._update_method_desc()
+        if self.pipeline is not None:
+            self.alarm_q.put("[參數] 已更新,下次「開始」才會套用到即時偵測")
+
+    def _update_method_desc(self):
+        m = self._current_method()
+        tag = "判定不含學習權重" if m.ai_free_decision else "含學習權重"
+        n = len(diff_from(load_config(self.infer_config),
+                          self.overrides.get(m.key, {})))
+        tuned = f"　參數已調整 {n} 項" if n else ""
+        self.method_desc.config(text=f"[{m.key} / {tag}]{tuned} {m.desc}")
 
     # ---------- 控制 ----------
 
@@ -1012,7 +1061,7 @@ class DemoGUI:
         """在背景執行緒載入 pipeline(避免凍住 UI),然後開始處理。"""
         try:
             from inference.pipeline import SmokingDetectionPipeline
-            infer_cfg = load_config(self.infer_config)
+            infer_cfg = self.current_config()
             ckpt = self.ckpt_var.get().strip()
             # 要不要載外觀網路由方法決定,不再由「權重欄有沒有填」決定 ——
             # 否則選了純規則卻忘了清空權重欄,跑的其實是融合版
@@ -1417,7 +1466,9 @@ class DemoGUI:
         open_video(self.root, rec["path"],
                    f"track {rec['tid']} 抽菸警報片段",
                    method=self._current_method(),
-                   infer_config=self.infer_config)
+                   infer_config=self.infer_config,
+                   overrides=self.overrides.get(
+                       self._current_method().key, {}))
 
     def _draw_frame(self, bgr):
         # 依影像區「目前實際尺寸」縮放:拉大視窗畫面就跟著放大

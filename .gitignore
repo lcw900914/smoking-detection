@@ -34,3 +34,6 @@ downloads/
 
 # 影片分析的側車檔
 .analysis/
+
+# GUI 的參數覆寫(個人校準,不進版控)
+configs/gui_overrides.json

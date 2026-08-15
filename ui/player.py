@@ -226,12 +226,13 @@ class VideoPlayer(tk.Toplevel):
 
     def __init__(self, master, path: str, title: str = "",
                  method=None, infer_config: str = "configs/inference.yaml",
-                 analysis=None, job=None):
+                 analysis=None, job=None, overrides=None):
         super().__init__(master)
         self.path = str(path)
         self.title(title or Path(self.path).name)
         self.method = method
         self.infer_config = infer_config
+        self.overrides = overrides or {}
 
         self.cap = cv2.VideoCapture(self.path)
         if not self.cap.isOpened():
@@ -583,7 +584,7 @@ class VideoPlayer(tk.Toplevel):
         try:
             a = analyse_video(
                 self.path, method=self.method,
-                infer_config=self.infer_config,
+                infer_config=self.infer_config, overrides=self.overrides,
                 on_progress=lambda *a: self._scan_q.put(("progress", a)),
                 cancel=self._scan_cancel)
             if not self._scan_cancel.is_set():
@@ -728,7 +729,8 @@ class AnalysisDialog(tk.Toplevel):
 
 
 def open_video(master, path: str, title: str = "", method=None,
-               infer_config: str = "configs/inference.yaml"):
+               infer_config: str = "configs/inference.yaml",
+               overrides=None):
     """開一支影片:**先分析、再播放**,但不強迫你等完。
 
     有側車檔就直接載入(分析要影片長度的兩倍時間,每次重開都重跑沒人
@@ -737,15 +739,17 @@ def open_video(master, path: str, title: str = "", method=None,
     a = Analysis.load(path)
     if a is not None:
         return VideoPlayer(master, path, title, method=method,
-                           infer_config=infer_config, analysis=a)
+                           infer_config=infer_config, analysis=a,
+                           overrides=overrides)
 
-    job = AnalysisJob(path, method, infer_config)
+    job = AnalysisJob(path, method, infer_config, overrides)
     dlg = AnalysisDialog(master, job)
     master.wait_window(dlg)
     if dlg.outcome == "wait":
         return VideoPlayer(master, path, title, method=method,
-                           infer_config=infer_config, analysis=job.result)
+                           infer_config=infer_config, analysis=job.result,
+                           overrides=overrides)
     # 先播放:分析還在跑,播放器自己盯著它,好了就把標記補上
     return VideoPlayer(master, path, title, method=method,
-                       infer_config=infer_config,
+                       infer_config=infer_config, overrides=overrides,
                        job=job if dlg.outcome == "background" else None)

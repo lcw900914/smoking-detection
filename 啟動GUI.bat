@@ -33,6 +33,14 @@ rem The detection method is chosen in the "method" dropdown of the control row
 rem -- all methods share this one GUI so they can be compared under identical
 rem input. Default is the pure-rule method, which needs no weight file at all.
 rem
+rem Switching method pops up its parameter sheet (the gear button reopens it):
+rem presence thresholds, what counts as one drag, alarm levels, skeleton rules,
+rem movement gating, review cut-offs. Only the parameters that method actually
+rem uses are listed, and EACH METHOD KEEPS ITS OWN -- loosening "rule" must not
+rem quietly move "hybrid" too, or a comparison stops being about the methods.
+rem Values live in configs\gui_overrides.json; the yaml files stay untouched.
+rem Live detection and video analysis read the same merged settings.
+rem
 rem Arguments are passed through, so a method can be preselected:
 rem     launch.bat --method rule+grammar
 rem Valid keys live in inference/methods.py; to see them with their

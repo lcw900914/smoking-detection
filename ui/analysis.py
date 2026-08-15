@@ -113,6 +113,7 @@ class Analysis:
 
 def analyse_video(path: str, method=None,
                   infer_config: str = "configs/inference.yaml",
+                  overrides: Optional[dict] = None,
                   on_progress: Optional[Callable] = None,
                   cancel: Optional[threading.Event] = None) -> Analysis:
     """整支影片跑一次判定,回傳抽菸時間與骨架。
@@ -126,7 +127,10 @@ def analyse_video(path: str, method=None,
     from inference.pipeline import SmokingDetectionPipeline
     from utils import load_config
 
-    cfg = load_config(infer_config)
+    # 覆寫值要在這裡套進去:分析與即時偵測必須吃同一份設定,不然畫面上
+    # 調好的門檻與分析標出來的位置對不起來
+    from ui.settings import apply_overrides
+    cfg = apply_overrides(load_config(infer_config), overrides or {})
     model_cfg, ckpt = None, None
     if method is not None and method.needs_appearance:
         model_cfg = load_config("configs/model.yaml")
@@ -225,8 +229,10 @@ class AnalysisJob:
     """
 
     def __init__(self, path: str, method=None,
-                 infer_config: str = "configs/inference.yaml"):
+                 infer_config: str = "configs/inference.yaml",
+                 overrides: Optional[dict] = None):
         self.path = str(path)
+        self.overrides = overrides or {}
         self.result: Optional[Analysis] = None
         self.error: Optional[str] = None
         self.progress = None          # (比例, 找到幾處, 已到第幾秒, 已花幾秒)
@@ -239,6 +245,7 @@ class AnalysisJob:
         try:
             a = analyse_video(self.path, method=method,
                               infer_config=infer_config,
+                              overrides=self.overrides,
                               on_progress=self._on_progress,
                               cancel=self._cancel)
             if not self._cancel.is_set():
