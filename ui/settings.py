@@ -30,13 +30,15 @@ class Param:
 
     def __init__(self, path: Tuple[str, ...], label: str, lo: float,
                  hi: float, step: float, unit: str = "", help: str = "",
-                 integer: bool = False, needs: str = "any"):
+                 integer: bool = False, needs: str = "any",
+                 boolean: bool = False):
         self.path = path
         self.label = label
         self.lo, self.hi, self.step = lo, hi, step
         self.unit = unit
         self.help = help
         self.integer = integer
+        self.boolean = boolean
         self.needs = needs          # any / skeleton / appearance / stage2
 
     @property
@@ -54,7 +56,9 @@ class Param:
             return method.stage2 is not None
         return True
 
-    def clamp(self, value: float) -> float:
+    def clamp(self, value):
+        if self.boolean:
+            return bool(value)
         v = max(self.lo, min(self.hi, float(value)))
         return int(round(v)) if self.integer else v
 
@@ -114,6 +118,12 @@ PARAMS: List[Tuple[str, List[Param]]] = [
               0.1, "",
               "手要先離臉這麼遠才採信之後的停留,擋姿態模型的腕點幻覺",
               needs="skeleton"),
+    ]),
+    ("錄影", [
+        Param(("alarm", "clip_overlay"), "警報片段疊加骨架", 0, 1, 1, "",
+              "關 = 存乾淨原始影像(訓練外觀模型的前提,烙印上去救不回來);"
+              "開 = 存與畫面相同的疊加版,給人複查用。只影響存檔,不影響顯示",
+              boolean=True),
     ]),
     ("移動排除", [
         Param(("move_gate", "max_heights"), "視為走動中的累積移動", 0.5, 10,

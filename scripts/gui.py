@@ -59,7 +59,9 @@ from ui.settings import (apply_overrides, diff_from,  # noqa: E402
 from ui.settings_dialog import SettingsDialog  # noqa: E402
 from utils import load_config  # noqa: E402
 
-VIDEO_W, VIDEO_H = 800, 600
+# 影像區的**初始**尺寸(之後隨視窗縮放)。高度壓在 460:800×600 加上
+# 控制列與下方清單會超過一般筆電螢幕的高度,底部整條被擠出視窗外
+VIDEO_W, VIDEO_H = 800, 420
 DEFAULT_CKPT = "checkpoints/hmdb_e2e_best.pt"
 _STAGE_NAMES = {0: "S1 舉手", 1: "S2 嘴部", 2: "S3 放下", 3: "背景"}
 
@@ -209,6 +211,8 @@ class DemoGUI:
                 cfg_all.get("move_gate", {}).get("enabled", True))
             self._init_wander_alert = bool(
                 cfg_all.get("presence", {}).get("alert_wandering", False))
+            self._init_wait_alert = bool(
+                cfg_all.get("presence", {}).get("alert_waiting", False))
             esc = cfg_all.get("escalation", {})
             self._init_dwell_min = float(esc.get("min_dwell", 2.0))
             self._init_dwell_max = float(esc.get("max_dwell", 5.0))
@@ -217,6 +221,7 @@ class DemoGUI:
             self._init_min_events = 3
             self._init_move_gate = True
             self._init_wander_alert = False
+            self._init_wait_alert = False
             self._init_dwell_min, self._init_dwell_max = 2.0, 5.0
         root.title("抽菸行為偵測 Demo — channel-as-temporal-buffer")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -226,6 +231,8 @@ class DemoGUI:
         self.running = False
         self.frame_q: "queue.Queue" = queue.Queue(maxsize=2)
         self.alarm_q: "queue.Queue" = queue.Queue()
+        self.alarm_meta_q: "queue.Queue" = queue.Queue()
+        self._show_skeleton = True
         # 錄影分頁(獨立於偵測:不解碼、不吃 GPU,兩者可同時開著)
         self.recorder = None
         self.rec_thread: threading.Thread = None
@@ -258,13 +265,14 @@ class DemoGUI:
         # 就必須有沒烙印骨架線與文字的原始影格,印上去救不回來;
         # 畫面顯示不受影響,一律照常疊加。
         # 影像執行緒只讀這個快取的 bool,不直接碰 tk 變數(非執行緒安全)
+        # 由方法參數表的 alarm.clip_overlay 決定(關 = 存乾淨影像)
         self._clip_overlay = False
         self._clip_overlay_applied = False
 
         # 條列式記錄(分頁)
-        self.log_entries = []          # 最新在前;{'text', 'rec'}
-        self.PAGE_SIZE = 8
-        self.page = 1
+        # 警報片段清單(檔名 + 縮圖)與診斷訊息分開存放
+        self.alarm_clips = []          # 最新在前的 mp4 路徑
+        self._alarm_dirty = False
         self._last_draw = 0.0          # 畫面重繪節流用
 
         self._build_layout()
@@ -336,85 +344,33 @@ class DemoGUI:
         self.panel_smoke = SlotPanel(
             self.track_panel, "⚠ 偵測到抽菸", width=190)
 
-        thr = ttk.LabelFrame(main, text="警報門檻", padding=6)
-        thr.grid(row=1, column=1, sticky="sew", padx=(6, 0))
-        self.trigger_var = tk.DoubleVar(value=self._init_trigger)
-        self.release_var = tk.DoubleVar(value=self._init_release)
-        for text, var in (("觸發", self.trigger_var), ("解除", self.release_var)):
-            row = ttk.Frame(thr)
-            row.pack(fill="x", pady=2)
-            ttk.Label(row, text=text, width=6).pack(side="left")
-            s = ttk.Scale(row, from_=0.0, to=1.0, variable=var,
-                          command=self._apply_thresholds)
-            s.pack(side="left", fill="x", expand=True)
-            lbl = ttk.Label(row, width=5)
-            lbl.pack(side="left")
-            var.trace_add("write",
-                          lambda *_, v=var, l=lbl: l.config(text=f"{v.get():.2f}"))
-            lbl.config(text=f"{var.get():.2f}")
-
-        # 通報次數:手到嘴事件 ≥ N 次才允許紅色警報(即時生效)
-        row = ttk.Frame(thr)
-        row.pack(fill="x", pady=2)
-        ttk.Label(row, text="次數", width=6).pack(side="left")
-        self.min_events_var = tk.IntVar(value=self._init_min_events)
-        ttk.Spinbox(row, from_=1, to=10, width=4,
-                    textvariable=self.min_events_var,
-                    command=self._apply_thresholds).pack(side="left")
-        ttk.Label(row, text=" 次手到嘴才通報").pack(side="left")
-        self.min_events_var.trace_add(
-            "write", lambda *_: self._apply_thresholds())
-
-        # 停留窗口:min~max 秒的手到嘴停留才算抽菸一口(現場可校準)
-        row = ttk.Frame(thr)
-        row.pack(fill="x", pady=2)
-        ttk.Label(row, text="停留", width=6).pack(side="left")
-        self.dwell_min_var = tk.DoubleVar(value=self._init_dwell_min)
-        self.dwell_max_var = tk.DoubleVar(value=self._init_dwell_max)
-        ttk.Spinbox(row, from_=0.5, to=10.0, increment=0.5, width=4,
-                    textvariable=self.dwell_min_var,
-                    command=self._apply_thresholds).pack(side="left")
-        ttk.Label(row, text=" ~ ").pack(side="left")
-        ttk.Spinbox(row, from_=1.0, to=20.0, increment=0.5, width=4,
-                    textvariable=self.dwell_max_var,
-                    command=self._apply_thresholds).pack(side="left")
-        ttk.Label(row, text=" 秒才算一口(短=扶眼鏡 長=講電話)").pack(
-            side="left")
-        for v in (self.dwell_min_var, self.dwell_max_var):
-            v.trace_add("write", lambda *_: self._apply_thresholds())
-
-        # 移動排除開關:走動中(累積移動 ≥ 3 倍身高)不視為抽菸
-        self.move_gate_var = tk.BooleanVar(value=self._init_move_gate)
-        ttk.Checkbutton(thr, text="移動排除(走動中不通報)",
-                        variable=self.move_gate_var,
-                        command=self._apply_thresholds).pack(
-            anchor="w", pady=2)
-
-        # 徘徊通報開關(預設關):有人在鏡頭裡一直繞但沒離開 → 橘色警示。
-        # 與抽菸警報是不同語意的事件,不影響紅色警報與 P_t
-        self.wander_var = tk.BooleanVar(value=self._init_wander_alert)
-        ttk.Checkbutton(thr, text="徘徊時通報(橘色,非抽菸警報)",
-                        variable=self.wander_var,
-                        command=self._apply_thresholds).pack(
-            anchor="w", pady=2)
-
-        # 診斷訊息開關(預設關):校準時才顯示未計入/未達門檻的原因
-        # 注意:工作執行緒不可直接讀 tk 變數(tkinter 非執行緒安全),
-        # 由 _apply_thresholds 在主執行緒快取成 _diag_enabled
-        self.diag_var = tk.BooleanVar(value=False)
-        self._diag_enabled = False
-        ttk.Checkbutton(thr, text="顯示診斷訊息(校準用)",
-                        variable=self.diag_var,
-                        command=self._apply_thresholds).pack(
-            anchor="w", pady=2)
-
-        # 錄影疊加開關(預設關):關 = 存乾淨原始影像(蒐集訓練資料用),
-        # 開 = 存與畫面相同的疊加版(給人複查用)。只影響存檔,不影響顯示
-        self.clip_overlay_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(thr, text="錄影疊加骨架(蒐集訓練資料請關閉)",
-                        variable=self.clip_overlay_var,
-                        command=self._apply_thresholds).pack(
-            anchor="w", pady=2)
+        # 主畫面只留「要不要通報這一類」的開關。所有門檻數值都在
+        # 方法的參數表裡(⚙ 參數)——先前兩邊都能設同一個「次數」,
+        # 而主畫面會在管線建好後立刻覆蓋掉參數表的值,等於參數表白設。
+        sw = ttk.LabelFrame(main, text="通報開關", padding=8)
+        sw.grid(row=1, column=1, sticky="sew", padx=(6, 0))
+        self.alarm_smoke_var = tk.BooleanVar(value=True)
+        self.alarm_wander_var = tk.BooleanVar(value=self._init_wander_alert)
+        self.alarm_wait_var = tk.BooleanVar(value=self._init_wait_alert)
+        self.show_skel_var = tk.BooleanVar(value=True)
+        for text, var, hint in (
+                ("抽菸警報(紅色)", self.alarm_smoke_var,
+                 "關掉只做偵測與在場型態,不發紅色警報"),
+                ("徘徊警報(橘色)", self.alarm_wander_var,
+                 "在場久且一直在動,但沒離開"),
+                ("等待警報(橘色)", self.alarm_wait_var,
+                 "在場久且幾乎不動——抽菸的人多半是這一類"),
+                ("骨架可視化", self.show_skel_var,
+                 "畫面上疊骨架與腕-鼻距離線;只影響顯示")):
+            row = ttk.Frame(sw)
+            row.pack(fill="x", pady=3)
+            ttk.Checkbutton(row, text=text, variable=var,
+                            command=self._apply_switches).pack(anchor="w")
+            ttk.Label(row, text="　" + hint, foreground="#888888",
+                      wraplength=300, justify="left").pack(anchor="w")
+        ttk.Label(sw, text="門檻數值請按上方「⚙ 參數」——每個方法各有一組",
+                  foreground="#666666", wraplength=300,
+                  justify="left").pack(anchor="w", pady=(8, 0))
 
         # 下:控制列(上排選方法、下排選來源與權重)
         ctrl = ttk.Frame(main, padding=(0, 6))
@@ -468,30 +424,26 @@ class DemoGUI:
         self.method_var.set(self._method_label(methods_registry.default()))
         self._on_method_change()
 
-        # 警報記錄:條列式 + 分頁;警報項目可雙擊回放片段
-        log_frame = ttk.LabelFrame(main, text="警報記錄(雙擊警報項目可回放片段)",
-                                   padding=4)
-        log_frame.grid(row=3, column=0, columnspan=2, sticky="ew")
-        self.log = tk.Listbox(log_frame, height=6)
-        self.log.pack(fill="both", expand=True)
-        self.log.bind("<Double-Button-1>", self._on_log_dclick)
+        # 下方左右分開:警報是「結果」,診斷是「過程」。混在同一個清單裡
+        # 時,校準用的訊息會把真正的警報洗掉,而兩者的讀法完全不同。
+        bottom = ttk.Frame(main)
+        bottom.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        bottom.columnconfigure(0, weight=3)
+        bottom.columnconfigure(1, weight=2)
+        main.rowconfigure(3, weight=1)
 
-        pager = ttk.Frame(log_frame)
-        pager.pack(fill="x", pady=(4, 0))
-        ttk.Button(pager, text="◀ 上一頁", width=8,
-                   command=lambda: self._goto_page(self.page - 1)).pack(
-            side="left")
-        ttk.Label(pager, text=" 第").pack(side="left")
-        self.page_var = tk.IntVar(value=1)
-        self.page_spin = ttk.Spinbox(
-            pager, from_=1, to=1, width=4, textvariable=self.page_var,
-            command=lambda: self._goto_page(self.page_var.get()))
-        self.page_spin.pack(side="left", padx=2)
-        self.page_total_lbl = ttk.Label(pager, text="/ 1 頁")
-        self.page_total_lbl.pack(side="left")
-        ttk.Button(pager, text="下一頁 ▶", width=8,
-                   command=lambda: self._goto_page(self.page + 1)).pack(
-            side="left", padx=(8, 0))
+        log_frame = ttk.LabelFrame(bottom, text="警報片段(雙擊播放)",
+                                   padding=4)
+        log_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self.alarm_list = VideoList(log_frame, on_open=self._play_alarm_clip,
+                                    height=130,
+                                    empty_text="(還沒有警報)")
+        self.alarm_list.pack(fill="both", expand=True)
+
+        diag_frame = ttk.LabelFrame(bottom, text="診斷訊息", padding=4)
+        diag_frame.grid(row=0, column=1, sticky="nsew")
+        self.diag_box = tk.Listbox(diag_frame, height=8)
+        self.diag_box.pack(fill="both", expand=True)
 
         self._build_record_tab(record_tab)
         self._build_download_tab(download_tab)
@@ -1008,33 +960,26 @@ class DemoGUI:
         if p:
             self.ckpt_var.set(p)
 
-    def _apply_thresholds(self, _=None):
-        # 主執行緒快取診斷開關,供影像執行緒安全讀取
+    def _apply_switches(self, _=None):
+        """把四個開關套到執行中的管線。
+
+        這裡**只碰開關,不碰任何門檻數值** —— 門檻全部由方法的參數表決定。
+        先前主畫面也能設「次數」,而且會在管線建好後立刻覆蓋參數表的值,
+        等於參數表白設,兩邊還互相矛盾。
+        """
         try:
-            self._diag_enabled = bool(self.diag_var.get())
-            self._clip_overlay = bool(self.clip_overlay_var.get())
+            self._show_skeleton = bool(self.show_skel_var.get())
         except (tk.TclError, AttributeError):
-            pass  # 版面尚未建完(滑桿 trace 可能先觸發)
-        if self.pipeline is not None:
-            self.pipeline.alarm.trigger = self.trigger_var.get()
-            # 解除線夾在 [0.01, 觸發線-0.01]:觸發線拉到 0 時
-            # 解除線若為負,P≥0 永遠無法解除警報
-            self.pipeline.alarm.release = max(
-                0.01, min(self.release_var.get(),
-                          self.trigger_var.get() - 0.01))
-            try:  # Spinbox 打字中可能是空字串
-                self.pipeline.min_events = max(1, int(self.min_events_var.get()))
-            except (tk.TclError, ValueError):
-                pass
-            self.pipeline.move_gate_enabled = bool(self.move_gate_var.get())
-            self.pipeline.wander_alert_enabled = bool(self.wander_var.get())
-            try:
-                dmin = float(self.dwell_min_var.get())
-                dmax = float(self.dwell_max_var.get())
-                if 0 < dmin < dmax:
-                    self.pipeline.set_dwell_window(dmin, dmax)
-            except (tk.TclError, ValueError):
-                pass
+            return                      # 版面還沒建完
+        # 錄影疊加是設定值不是開關:蒐集訓練資料時必須是乾淨影像,
+        # 烙印上去救不回來,所以放在參數表裡而不是隨手可按的地方
+        self._clip_overlay = bool(
+            self.current_config().get("alarm", {}).get("clip_overlay", False))
+        if self.pipeline is None:
+            return
+        self.pipeline.smoking_alarm_enabled = bool(self.alarm_smoke_var.get())
+        self.pipeline.wander_alert_enabled = bool(self.alarm_wander_var.get())
+        self.pipeline.wait_alert_enabled = bool(self.alarm_wait_var.get())
 
     def start(self):
         if self.running:
@@ -1085,11 +1030,10 @@ class DemoGUI:
                        "frames": list(self.clip_buffer),
                        "pose": list(self.pose_buffer), "path": None}
                 self._active_recs.append(rec)
-                self.alarm_q.put({
-                    "text": time.strftime("%H:%M:%S") +
-                            f"  ⚠ track {tid} 觸發抽菸警報(P={P:.2f})"
-                            f" — 雙擊回放片段",
-                    "rec": rec})
+                # 清單只放片段,細節走診斷框——警報要一眼看得出「有幾件」,
+                # 混進過程訊息就看不出來了
+                self.alarm_q.put(time.strftime("%H:%M:%S") +
+                                 f"  ⚠ track {tid} 觸發抽菸警報(P={P:.2f})")
             pipeline.alarm.callback = gui_callback
             # 事件結算通知:每次手放下顯示停留秒數與是否計入(可觀察校準)
             # 記錄原則:預設只顯示「警報觸發」;
@@ -1097,22 +1041,21 @@ class DemoGUI:
             # 影像執行緒內執行:只讀主執行緒快取的 _diag_enabled,
             # 不可直接碰 tk 變數
             def log_event(tid, dwell, counted, reason):
-                if self._diag_enabled:
-                    mark = "✔" if counted else "✘"
-                    self.alarm_q.put(
-                        time.strftime("%H:%M:%S") +
-                        f"  track {tid} 停留 {dwell:.1f} 秒 {mark} {reason}")
+                mark = "✔" if counted else "✘"
+                self.alarm_q.put(
+                    time.strftime("%H:%M:%S") +
+                    f"  track {tid} 停留 {dwell:.1f} 秒 {mark} {reason}")
             pipeline.on_event = log_event
 
             # 徘徊通報:與抽菸警報同樣列進記錄(不受診斷開關影響),
             # 但不錄片段、不改 P_t —— 它是另一種事件,不是抽菸的證據
-            def log_wander(tid, stay, path):
-                self.alarm_q.put({
-                    "text": time.strftime("%H:%M:%S") +
-                            f"  ◆ track {tid} 徘徊(在場 {stay:.0f} 秒,"
-                            f"移動 {path:.1f} 倍身高)",
-                    "rec": None})
-            pipeline.on_presence = log_wander
+            def log_presence(tid, stay, path, kind):
+                name = presence_name(kind) or kind
+                self.alarm_q.put(
+                    time.strftime("%H:%M:%S") +
+                    f"  ◆ track {tid} {name}(在場 {stay:.0f} 秒,"
+                    f"移動 {path:.1f} 倍身高)")
+            pipeline.on_presence = log_presence
 
             # 第二階段複核結果:雙擊該列可看完整的基元時間軸與節律統計。
             # 這是兩層架構最大的賣點 —— 複查誤報時看得到系統憑什麼判
@@ -1122,15 +1065,13 @@ class DemoGUI:
                 text = (time.strftime("%H:%M:%S")
                         + f"  {icon} track {tid} 二次複核:{res.status_name}"
                         + f" — {res.reason} — 雙擊看依據")
-                self.alarm_q.put({"text": text, "rec": None,
-                                  "detail": res.detail})
+                self.alarm_q.put(text)
             pipeline.on_verify = log_verify
-            pipeline.on_log = lambda msg: (
-                self.alarm_q.put(time.strftime("%H:%M:%S") + "  " + msg)
-                if self._diag_enabled else None)
+            pipeline.on_log = lambda msg: self.alarm_q.put(
+                time.strftime("%H:%M:%S") + "  " + msg)
             self.pipeline = pipeline
             # 套用目前滑桿值(使用者的調整優先,不被設定檔覆蓋)
-            self._apply_thresholds()
+            self._apply_switches()
         except Exception as e:  # 載入失敗回報到 UI
             self.alarm_q.put(f"[錯誤] 模型載入失敗:{e}")
             self.root.after(0, lambda: (
@@ -1197,7 +1138,7 @@ class DemoGUI:
                         0, lambda r=rate, e=extra:
                         self.status_var.set(f"執行中 {r:.1f} fps{e}"))
                     fps_t0, fps_n = time.time(), 0
-            vis = draw_overlay(frame, results)
+            vis = draw_overlay(frame, results, self._show_skeleton)
             if do_step:
                 # 存檔用哪一份由開關決定:關 = 乾淨原始影格(可訓練外觀模型)
                 self._record_clip_frame(
@@ -1261,18 +1202,26 @@ class DemoGUI:
             self._update_tracks(results)     # 文字面板很便宜,照常更新
         except queue.Empty:
             pass
-        changed = False
         try:
             while True:
                 item = self.alarm_q.get_nowait()
-                if isinstance(item, str):
-                    item = {"text": item, "rec": None}
-                self.log_entries.insert(0, item)  # 最新在前
-                changed = True
+                if isinstance(item, dict) and item.get("clip"):
+                    # 警報片段:只留檔名與縮圖,細節留給播放器
+                    self.alarm_clips.insert(0, item["clip"])
+                    self._alarm_dirty = True
+                else:
+                    text = item if isinstance(item, str) else item.get("text", "")
+                    self.log_diag(text)
         except queue.Empty:
             pass
-        if changed:
-            self._render_log()
+        if self._alarm_dirty:
+            self._alarm_dirty = False
+            self.refresh_alarm_list()
+        try:
+            while True:
+                self.alarm_list.apply_meta(self.alarm_meta_q.get_nowait())
+        except queue.Empty:
+            pass
         # 錄影分頁:訊息照單全收,狀態每兩秒才刷一次(要掃資料夾,別太勤)
         try:
             while True:
@@ -1384,6 +1333,8 @@ class DemoGUI:
             vw.write(f)
         vw.release()
         rec["path"] = str(path)
+        # 檔案寫好了才進清單,不然縮圖會讀到還沒寫完的檔
+        self.alarm_q.put({"clip": str(path)})
         self._write_pose(rec, path)
 
     def _write_pose(self, rec, clip_path):
@@ -1426,49 +1377,35 @@ class DemoGUI:
 
     # ---------- 條列式記錄(分頁)與回放 ----------
 
-    def _total_pages(self) -> int:
-        return max(1, -(-len(self.log_entries) // self.PAGE_SIZE))
-
-    def _goto_page(self, page: int):
-        self.page = min(max(1, int(page)), self._total_pages())
-        self._render_log()
-
-    def _render_log(self):
-        total = self._total_pages()
-        self.page = min(self.page, total)
-        self.page_var.set(self.page)
-        self.page_spin.configure(to=total)
-        self.page_total_lbl.config(text=f"/ {total} 頁"
-                                        f"(共 {len(self.log_entries)} 筆)")
-        self.log.delete(0, tk.END)
-        start = (self.page - 1) * self.PAGE_SIZE
-        for entry in self.log_entries[start:start + self.PAGE_SIZE]:
-            self.log.insert(tk.END, entry["text"])
-
-    def _on_log_dclick(self, _event):
-        sel = self.log.curselection()
-        if not sel:
+    def _play_alarm_clip(self, path):
+        """雙擊警報片段:走跟影片下載分頁同一個播放器。"""
+        if not Path(path).exists():
+            messagebox.showinfo("片段還在錄製",
+                                "警報片段錄製中(觸發後續錄 4 秒),稍候再點。")
             return
-        idx = (self.page - 1) * self.PAGE_SIZE + sel[0]
-        if idx >= len(self.log_entries):
-            return
-        entry = self.log_entries[idx]
-        rec = entry.get("rec")
-        if rec is None:
-            if entry.get("detail"):     # 複核結果:顯示判定依據
-                DetailWindow(self.root, entry["text"], entry["detail"])
-            return                      # 其餘非警報項目
-        if rec.get("path") is None:
-            messagebox.showinfo("片段錄製中",
-                                "警報片段還在錄製(觸發後續錄 4 秒),"
-                                "請稍候再點。")
-            return
-        open_video(self.root, rec["path"],
-                   f"track {rec['tid']} 抽菸警報片段",
+        open_video(self.root, str(path), Path(path).name,
                    method=self._current_method(),
                    infer_config=self.infer_config,
-                   overrides=self.overrides.get(
-                       self._current_method().key, {}))
+                   overrides=self.overrides.get(self._current_method().key,
+                                                {}))
+
+    def refresh_alarm_list(self):
+        """重建警報片段清單(縮圖由 VideoList 在背景解碼)。"""
+        pending = self.alarm_list.set_files(
+            [Path(p) for p in self.alarm_clips if Path(p).exists()])
+        if not pending:
+            return
+
+        def work():
+            for q in pending:
+                self.alarm_meta_q.put(video_meta(q))
+        threading.Thread(target=work, daemon=True).start()
+
+    def log_diag(self, text: str):
+        """診斷訊息進右邊那個框(最新在上,只留最近 400 筆)。"""
+        self.diag_box.insert(0, text)
+        if self.diag_box.size() > 400:
+            self.diag_box.delete(400, tk.END)
 
     def _draw_frame(self, bgr):
         # 依影像區「目前實際尺寸」縮放:拉大視窗畫面就跟著放大
@@ -1566,7 +1503,8 @@ class VideoList(ttk.Frame):
     跨執行緒建,所以背景只回傳 numpy 陣列,由 _poll_ui 收進來再轉。
     """
 
-    def __init__(self, parent, on_open, height: int = 300):
+    def __init__(self, parent, on_open, height: int = 300,
+                 empty_text: str = "(這個資料夾還沒有影片)"):
         super().__init__(parent)
         self.on_open = on_open
         canvas = tk.Canvas(self, height=height, highlightthickness=0)
@@ -1586,7 +1524,7 @@ class VideoList(ttk.Frame):
         self.canvas = canvas
         self._rows = {}            # path -> (frame, thumb_label)
         self._photos = {}          # path -> PhotoImage(防 GC)
-        self.empty = ttk.Label(self.inner, text="(這個資料夾還沒有影片)",
+        self.empty = ttk.Label(self.inner, text=empty_text,
                                foreground="#888888")
         self.empty.pack(anchor="w", padx=8, pady=8)
 

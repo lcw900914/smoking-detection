@@ -18,6 +18,17 @@ rem video -> Download. The Download tab refuses live URLs on purpose.
 rem
 rem ---- Live detection tab ----
 rem
+rem The main screen carries only four switches -- smoking alarm, wandering
+rem alarm, waiting alarm, skeleton overlay. Every threshold lives in the
+rem method's parameter sheet instead. They used to be settable in both
+rem places, and the main screen overwrote the sheet right after startup, so
+rem the sheet silently did nothing.
+rem
+rem Below: alarm clips on the left (file name + thumbnail, double-click to
+rem play), diagnostics on the right (dwell seconds, why an event did or did
+rem not count). Alarms are results, diagnostics are process -- in one shared
+rem list the calibration chatter buries the actual alarms.
+rem
 rem The status panel is three columns:
 rem     Present      people still MOVING (passing / wandering), with
 rem                  ID + behaviour + stage / count / facing-away

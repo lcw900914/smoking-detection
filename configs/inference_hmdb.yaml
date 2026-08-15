@@ -48,6 +48,8 @@ presence:                 # 在場型態:經過 / 徘徊 / 等待(純軌跡幾�
   run_speed: 1.5          # 平均速度超過此值(身高/秒)→ 記為跑步
   alert_wandering: false  # 徘徊時通報(GUI 可開關)。橘色警示,不是紅色
                           # 抽菸警報,也不影響 P_t —— 兩者語意不同
+  alert_waiting: false    # 等待時通報(同上)。站著不動的人才是抽菸的
+                          # 主要對象,所以這個開關比徘徊更常用得到
 
 move_gate:                # 移動排除(GUI 可開關):走動中不視為抽菸
   enabled: true
@@ -113,6 +115,8 @@ alarm:
   count_driven: true      # 次數主導:次數達標+無排除條件 → 直接推向觸發
                           # (否則 0.4×次數分上限 0.32 過不了觸發線,
                           #  警報實質被網路分數決定,次數形同虛設)
+  clip_overlay: false     # 警報片段是否烙印骨架(關 = 乾淨影像,
+                          # 蒐集訓練資料用;開 = 給人複查用)
   snapshot_dir: ./alarms  # 觸發時截圖存檔位置
 
 track_recycle_sec: 3.0    # track 消失超過此秒數即回收 buffer 與狀態

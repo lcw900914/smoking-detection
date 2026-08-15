@@ -17,7 +17,8 @@ CFG = {
     "escalation": {"min_dwell": 2.0, "max_dwell": 5.0, "min_gap": 2.0,
                    "window_sec": 90.0},
     "alarm": {"min_events": 2, "trigger_threshold": 0.6,
-              "release_threshold": 0.3, "sustain_sec": 2.0},
+              "release_threshold": 0.3, "sustain_sec": 2.0,
+              "clip_overlay": False},
     "skeleton": {"near_ratio": 0.9, "move_ratio": 0.35, "min_scale_px": 24,
                  "rise_margin": 0.5},
     "move_gate": {"max_heights": 3.0, "window_sec": 10.0},
@@ -165,3 +166,19 @@ class TestPathHelpers:
         d = {}
         set_in(d, ("a", "b", "c"), 1)
         assert d == {"a": {"b": {"c": 1}}}
+
+
+class TestBooleanParam:
+    """錄影疊加是布林值:關 = 乾淨影像(訓練外觀模型的前提)。"""
+
+    def test_stays_boolean_after_apply(self):
+        out = apply_overrides(CFG, {"alarm.clip_overlay": 1})
+        assert out["alarm"]["clip_overlay"] is True
+
+    def test_zero_means_off(self):
+        out = apply_overrides(CFG, {"alarm.clip_overlay": 0})
+        assert out["alarm"]["clip_overlay"] is False
+
+    def test_shows_for_every_method(self):
+        for m in reg.METHODS:
+            assert "alarm.clip_overlay" in defaults_for(CFG, m), m.key

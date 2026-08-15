@@ -64,6 +64,7 @@ class TrackState:
     presence: Optional[PresenceClassifier] = None
     presence_state: str = "unknown"   # 經過 / 徘徊 / 等待
     wander_notified: bool = False     # 徘徊已通報(每個 track 只報一次)
+    wait_notified: bool = False       # 等待已通報(同上)
     skeleton: Optional[SkeletonStageEstimator] = None
     loiter: Optional[LoiterDetector] = None
     last_seen: float = 0.0
@@ -175,6 +176,12 @@ class SmokingDetectionPipeline:
         self.presence_cfg = infer_cfg.get("presence", {})
         self.wander_alert_enabled = bool(
             self.presence_cfg.get("alert_wandering", False))
+        # 等待通報:與徘徊同一類(在場型態的橘色警示),不影響抽菸警報。
+        # 站著不動的人才是抽菸的主要對象,所以這個開關比徘徊更常用得到
+        self.wait_alert_enabled = bool(
+            self.presence_cfg.get("alert_waiting", False))
+        # 抽菸警報總開關:關掉只做偵測與在場型態,不發紅色警報
+        self.smoking_alarm_enabled = True
         self.on_presence = None   # (track_id, 在場秒數, 累積路徑)
         self._dwell_override = None  # GUI 即時調整停留窗口用
 
@@ -317,12 +324,17 @@ class SmokingDetectionPipeline:
                 # 徘徊通報:每個 track 只報一次。不因狀態在
                 # 徘徊/等待門檻附近抖動而重複通報 —— 人還在原地,
                 # 一次就夠;離場後 track 回收,重新進場才會再報
-                if (self.wander_alert_enabled and not st.wander_notified
-                        and st.presence_state == PresenceClassifier.WANDERING):
-                    st.wander_notified = True
-                    if self.on_presence is not None:
-                        stay, path, _span, _speed = st.presence.stats()
-                        self.on_presence(tid, stay, path)
+                for kind, on, done in (
+                        (PresenceClassifier.WANDERING,
+                         self.wander_alert_enabled, "wander_notified"),
+                        (PresenceClassifier.WAITING,
+                         self.wait_alert_enabled, "wait_notified")):
+                    if (on and not getattr(st, done)
+                            and st.presence_state == kind):
+                        setattr(st, done, True)
+                        if self.on_presence is not None:
+                            stay, path, _s, _v = st.presence.stats()
+                            self.on_presence(tid, stay, path, kind)
             boxes.append(smoothed)
             tids.append(tid)
             if self.use_model:
@@ -424,7 +436,8 @@ class SmokingDetectionPipeline:
             # 否則「純網路」實際上是被規則綁著跑,失去對照的意義
             enough_events = (st.counter.count() >= self.min_events
                              if self.method.count_gate else True)
-            allow = (not is_back
+            allow = (self.smoking_alarm_enabled
+                     and not is_back
                      and not (self.move_gate_enabled and st.moving)
                      and not st.phone
                      and enough_events)
@@ -467,6 +480,9 @@ class SmokingDetectionPipeline:
                 "wander_alert": (self.wander_alert_enabled
                                  and st.presence_state
                                  == PresenceClassifier.WANDERING),
+                "wait_alert": (self.wait_alert_enabled
+                               and st.presence_state
+                               == PresenceClassifier.WAITING),
                 "orientation": ori,
                 "unverified": st.unverified,
                 "moving": self.move_gate_enabled and st.moving,
@@ -679,11 +695,12 @@ PRESENCE_NAMES = {"passing": "經過", "running": "經過(跑)",
                   "unknown": ""}
 
 
-def draw_overlay(frame: np.ndarray, results: Dict[int, dict]) -> np.ndarray:
+def draw_overlay(frame: np.ndarray, results: Dict[int, dict],
+                 show_skeleton: bool = True) -> np.ndarray:
     """畫面疊加:框、ID、階段、次數警戒等級、逗留標記、P_t 條、骨架。"""
     vis = frame.copy()
     for tid, r in results.items():
-        if r.get("kpts") is not None:
+        if show_skeleton and r.get("kpts") is not None:
             draw_skeleton(vis, r["kpts"], stage_id=r["stage"],
                           d_norm=r.get("d_norm"))
         x1, y1, x2, y2 = [int(v) for v in r["bbox"]]
@@ -693,9 +710,9 @@ def draw_overlay(frame: np.ndarray, results: Dict[int, dict]) -> np.ndarray:
         downgraded = r["alarm"] and r.get("verify") == "review"
         if r["alarm"] and not downgraded:
             color = (0, 0, 255)          # 紅:警報
-        elif downgraded or r.get("unverified") or r.get("loiter") \
-                or r.get("wander_alert"):
-            color = (0, 165, 255)        # 橘:無法確認 / 逗留 / 徘徊警示
+        elif (downgraded or r.get("unverified") or r.get("loiter")
+              or r.get("wander_alert") or r.get("wait_alert")):
+            color = (0, 165, 255)   # 橘:無法確認 / 逗留 / 徘徊 / 等待警示
         elif level >= 0.5:
             color = (0, 200, 255)        # 黃:中警戒
         else:

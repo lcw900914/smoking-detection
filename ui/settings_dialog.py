@@ -73,8 +73,13 @@ class SettingsDialog(tk.Toplevel):
                     side="left")
                 var = tk.StringVar(value=_fmt(cur.get(p.key, p.lo), p))
                 self._vars[p.key] = (var, p)
-                ttk.Spinbox(row, from_=p.lo, to=p.hi, increment=p.step,
-                            textvariable=var, width=8).pack(side="left")
+                if p.boolean:
+                    ttk.Checkbutton(
+                        row, variable=var, onvalue="1", offvalue="0",
+                        text="開啟").pack(side="left")
+                else:
+                    ttk.Spinbox(row, from_=p.lo, to=p.hi, increment=p.step,
+                                textvariable=var, width=8).pack(side="left")
                 ttk.Label(row, text=p.unit, width=10, anchor="w").pack(
                     side="left", padx=(4, 8))
                 if p.help:
@@ -120,4 +125,6 @@ class SettingsDialog(tk.Toplevel):
 
 
 def _fmt(value, p) -> str:
+    if p.boolean:
+        return "1" if value else "0"
     return str(int(round(float(value)))) if p.integer else f"{float(value):g}"

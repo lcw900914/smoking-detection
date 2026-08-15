@@ -67,6 +67,7 @@ presence:                 # 在場型態:經過 / 徘徊 / 等待(純軌跡幾�
   run_speed: 1.5          # 平均速度超過此值(身高/秒)→ 記為跑步
   alert_wandering: false  # 徘徊時通報(GUI 可開關)。橘色警示,不是紅色
                           # 抽菸警報,也不影響 P_t —— 兩者語意不同
+  alert_waiting: false    # 等待時通報(同上)
 
 verify:                   # 第二階段複核(只有含 stage2 的方法會用到)
                           # 見 inference/verifier.py:降級不否決,判「非抽菸」
@@ -105,6 +106,8 @@ alarm:
   sustain_sec: 3.0        # 超過觸發門檻需持續秒數
   min_events: 3           # 手到嘴事件 ≥ 此次數才通報(GUI 可調)
   count_driven: true      # 次數主導:次數達標+無排除條件 → 直接推向觸發
+  clip_overlay: false     # 警報片段是否烙印骨架(關 = 乾淨影像,
+                          # 蒐集訓練資料用;開 = 給人複查用)
   snapshot_dir: ./alarms  # 觸發時截圖存檔位置
 
 track_recycle_sec: 3.0    # track 消失超過此秒數即回收 buffer 與狀態
