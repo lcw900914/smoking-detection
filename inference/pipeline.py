@@ -65,6 +65,7 @@ class TrackState:
     presence_state: str = "unknown"   # 經過 / 徘徊 / 等待
     wander_notified: bool = False     # 徘徊已通報(每個 track 只報一次)
     wait_notified: bool = False       # 等待已通報(同上)
+    wait_gate_logged: bool = False    # 「型態不符」只提示一次
     skeleton: Optional[SkeletonStageEstimator] = None
     loiter: Optional[LoiterDetector] = None
     last_seen: float = 0.0
@@ -182,6 +183,12 @@ class SmokingDetectionPipeline:
             self.presence_cfg.get("alert_waiting", False))
         # 抽菸警報總開關:關掉只做偵測與在場型態,不發紅色警報
         self.smoking_alarm_enabled = True
+        # 只有「等待」才判抽菸:抽菸是站定了才做的事,經過與徘徊的人
+        # 手部擺動很像手到嘴。這比移動排除嚴格——移動排除看的是 10 秒內
+        # 的位移,一個剛進畫面、型態還在「判定中」的人只要當下沒走動就
+        # 攔不住;這一條看的是在場型態本身。
+        self.smoking_requires_waiting = bool(
+            self.presence_cfg.get("smoking_requires_waiting", True))
         self.on_presence = None   # (track_id, 在場秒數, 累積路徑)
         self._dwell_override = None  # GUI 即時調整停留窗口用
 
@@ -436,11 +443,24 @@ class SmokingDetectionPipeline:
             # 否則「純網路」實際上是被規則綁著跑,失去對照的意義
             enough_events = (st.counter.count() >= self.min_events
                              if self.method.count_gate else True)
+            waiting_ok = (not self.smoking_requires_waiting
+                          or st.presence_state == PresenceClassifier.WAITING)
             allow = (self.smoking_alarm_enabled
+                     and waiting_ok
                      and not is_back
                      and not (self.move_gate_enabled and st.moving)
                      and not st.phone
                      and enough_events)
+            # 講清楚為什麼沒通報:次數夠了卻卡在型態,不說的話看起來像
+            # 偵測壞掉(等待要在場滿 long_stay 秒才成立,預設 20 秒)
+            if (self.smoking_alarm_enabled and enough_events
+                    and not waiting_ok and self.on_log is not None
+                    and not st.wait_gate_logged):
+                st.wait_gate_logged = True
+                self.on_log(
+                    f"track {tid} 次數已達標,但在場型態是"
+                    f"「{PRESENCE_NAMES.get(st.presence_state) or '判定中'}」"
+                    f",只有「等待」才判抽菸 → 不通報")
             # 次數主導:條件全過時分數直接推滿,P 快速進入觸發區,
             # 經 sustain 秒確認後通報(事件過期後 P 自然衰退解除)
             if self.count_driven and allow and self.method.count_gate:

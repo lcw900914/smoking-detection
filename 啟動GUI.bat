@@ -22,7 +22,14 @@ rem The main screen carries only four switches -- smoking alarm, wandering
 rem alarm, waiting alarm, skeleton overlay. Every threshold lives in the
 rem method's parameter sheet instead.
 rem
-rem WORTH KNOWING: the sheet's "movement gating" is ON by default, and it
+rem WORTH KNOWING: smoking is only ever flagged for people in the WAITING
+rem state -- passing and wandering never raise a smoking alarm. Smoking is
+rem something you stop to do, and a walker's arm swing looks like a drag.
+rem Waiting needs the person on screen for long_stay seconds (20 by
+rem default); before that the state reads "judging" and stays silent too.
+rem Both this and the threshold live in the parameter sheet.
+rem
+rem The sheet's "movement gating" is also ON by default, and it
 rem blocks smoking alarms for anyone who is walking (arm swing looks like
 rem hand-to-mouth). The visible effect is that PASSING and WANDERING people
 rem are practically never flagged -- only people who have stopped. Turn it

@@ -12,7 +12,8 @@ from ui.settings import (all_params, apply_overrides, defaults_for,
                          set_in)
 
 CFG = {
-    "presence": {"long_stay": 20.0, "wander_path": 3.0, "short_stay": 8.0,
+    "presence": {"smoking_requires_waiting": True,
+                 "long_stay": 20.0, "wander_path": 3.0, "short_stay": 8.0,
                  "pass_path": 1.0, "run_speed": 1.5, "window_sec": 60.0},
     "escalation": {"min_dwell": 2.0, "max_dwell": 5.0, "min_gap": 2.0,
                    "window_sec": 90.0},
@@ -202,3 +203,18 @@ class TestMoveGateSwitch:
     def test_shows_for_every_method(self):
         for m in reg.METHODS:
             assert "move_gate.enabled" in defaults_for(CFG, m), m.key
+
+
+class TestWaitingGate:
+    """只有「等待」才判抽菸——使用者反覆強調的規則,必須看得到也關得掉。"""
+
+    def test_is_adjustable(self):
+        assert "presence.smoking_requires_waiting" in defaults_for(
+            CFG, reg.get("rule"))
+
+    def test_default_is_on(self):
+        assert CFG["presence"]["smoking_requires_waiting"] is True
+
+    def test_can_be_turned_off(self):
+        out = apply_overrides(CFG, {"presence.smoking_requires_waiting": 0})
+        assert out["presence"]["smoking_requires_waiting"] is False

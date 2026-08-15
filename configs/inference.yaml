@@ -68,6 +68,8 @@ presence:                 # 在場型態:經過 / 徘徊 / 等待(純軌跡幾�
   alert_wandering: false  # 徘徊時通報(GUI 可開關)。橘色警示,不是紅色
                           # 抽菸警報,也不影響 P_t —— 兩者語意不同
   alert_waiting: false    # 等待時通報(同上)
+  smoking_requires_waiting: true
+                          # 只有「等待」才判抽菸(見 inference_hmdb.yaml 的說明)
 
 verify:                   # 第二階段複核(只有含 stage2 的方法會用到)
                           # 見 inference/verifier.py:降級不否決,判「非抽菸」
