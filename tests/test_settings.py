@@ -24,7 +24,7 @@ CFG = {
                  "rise_margin": 0.5},
     "move_gate": {"enabled": True, "max_heights": 3.0,
                   "window_sec": 10.0},
-    "state_machine": {"weights": {"state_machine": 0.4, "network": 0.6}},
+    "fusion": {"count": 0.4, "network": 0.6},
     "verify": {"min_smoking": 0.25, "min_valid_ratio": 0.15,
                "min_span_sec": 3.0, "window_sec": 90.0},
 }
@@ -56,7 +56,8 @@ class TestFilteringByMethod:
     def test_pure_rule_hides_fusion_weights(self):
         """純規則沒有網路可融合,列出來只會讓人以為調了有用。"""
         keys = defaults_for(CFG, reg.get("rule"))
-        assert "state_machine.weights.network" not in keys
+        assert "fusion.network" not in keys
+        assert "fusion.count" not in keys
 
     def test_pure_rule_hides_verify(self):
         assert "verify.min_smoking" not in defaults_for(CFG, reg.get("rule"))
@@ -66,8 +67,19 @@ class TestFilteringByMethod:
                                                     reg.get("rule+grammar"))
 
     def test_appearance_method_shows_weights(self):
-        assert "state_machine.weights.network" in defaults_for(
-            CFG, reg.get("hybrid"))
+        keys = defaults_for(CFG, reg.get("hybrid"))
+        assert "fusion.network" in keys
+        assert "fusion.count" in keys
+
+    def test_fusion_weights_are_not_under_state_machine(self):
+        """融合權重與 StageStateMachine 無關 —— 它的 score() 根本沒被讀。
+
+        舊版把它們放在 state_machine.weights 底下、第一項還叫
+        「規則權重」,讓人以為調的是順序檢查的權重;實際上乘的一直是
+        HandToMouthCounter 的次數分數。放回原處就是把這個誤導種回去。
+        """
+        assert not any(p.key.startswith("state_machine.weights")
+                       for p in all_params())
 
     def test_network_only_hides_skeleton_rules(self):
         """純外觀網路不看骨架,near_ratio 之類調了不會有作用。"""
@@ -88,9 +100,9 @@ class TestApplyOverrides:
         assert CFG["presence"]["long_stay"] == 20.0
 
     def test_nested_path(self):
-        out = apply_overrides(CFG, {"state_machine.weights.network": 0.9})
-        assert out["state_machine"]["weights"]["network"] == 0.9
-        assert out["state_machine"]["weights"]["state_machine"] == 0.4
+        out = apply_overrides(CFG, {"fusion.network": 0.9})
+        assert out["fusion"]["network"] == 0.9
+        assert out["fusion"]["count"] == 0.4
 
     def test_clamps_out_of_range(self):
         """覆寫檔是純文字,手改壞了不該讓管線帶著荒謬的值跑起來。"""

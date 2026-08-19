@@ -189,6 +189,9 @@ class SmokingDetectionPipeline:
 
         sm = infer_cfg["state_machine"]
         self.sm_cfg = sm
+        # 融合權重與狀態機無關,2026-08-19 從 state_machine.weights 搬出來
+        self.fusion_cfg = infer_cfg.get("fusion", {"count": 0.5,
+                                                   "network": 0.5})
         al = infer_cfg["alarm"]
         # 通報次數門檻:手到嘴事件 ≥ 此次數才允許紅色警報(GUI 可調)
         self.min_events = int(al.get("min_events", 3))
@@ -315,7 +318,10 @@ class SmokingDetectionPipeline:
                                else esc.get("max_dwell", 5.0)),
                     min_gap=esc.get("min_gap", 2.0),
                     gap_tolerance=esc.get("gap_tolerance", 0.5),
-                    levels=((1, lv["low"]), (2, lv["mid"]), (3, lv["high"]))),
+                    levels=((1, lv["low"]), (2, lv["mid"]), (3, lv["high"])),
+                    # 由 Method.apply() 依方法注入(見 inference/methods.py)
+                    require_release=esc.get("require_release", False),
+                    release_window=esc.get("release_window", 1.0)),
                 skeleton=skeleton, loiter=loiter)
         return self._tracks[tid]
 
@@ -489,7 +495,7 @@ class SmokingDetectionPipeline:
         # 融合與警報:cycle = w_sm × 次數警戒分數 + w_net × 網路分數
         # 背向時:骨架已棄權(無事件),且紅色警報被閘門擋下——
         # 網路分數若仍偏高,分流為橘色「無法確認」警示 + hard case 存檔
-        w = self.sm_cfg["weights"]
+        w = self.fusion_cfg
         unv = self.cfg.get("unverified", {})
         mode = self.method.stage1
         for i, tid in enumerate(tids):
@@ -502,7 +508,7 @@ class SmokingDetectionPipeline:
                 cyc = float(net_scores[i])        # 純網路:只看外觀分數
             elif net_scores is not None:
                 cyc = cycle_score(st.counter.score(), float(net_scores[i]),
-                                  w["state_machine"], w["network"])
+                                  w.get("count", 0.5), w.get("network", 0.5))
             elif self.skeleton_enabled:
                 cyc = st.counter.score()  # 純骨架模式(無模型)
             else:

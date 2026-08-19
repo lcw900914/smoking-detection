@@ -29,7 +29,8 @@ from torch.utils.data import DataLoader, Subset
 from stage2.composition import STAT_DIM, grammar_scores
 from stage2.hier_dataset import (CompositionDataset, collate_tokens,
                                  load_pose_items)
-from stage2.hier_model import CompositionNet, PrimitiveNet, count_params
+from stage2.hier_model import (ENCODERS, CompositionNet, PrimitiveNet,
+                                count_params)
 from stage2.kinematics import graph_features, kinematic_features
 from stage2.taxonomy import DEEP_CLASSES, DEEP_NAMES, COARSE_NEGATIVE_CODES
 from utils import resolve_device, set_seed
@@ -87,15 +88,27 @@ def filter_rate_at_full_recall(smoke_prob, y_smoke):
 def main():
     ap = argparse.ArgumentParser(description="L2 片段序列分類訓練")
     ap.add_argument("--folds", type=int, default=5)
+    ap.add_argument("--seed", type=int, default=42,
+                    help="只影響權重初始化與訓練時的洗牌;**fold 切分"
+                         "固定用 42**,換種子仍是同一批驗證段,比較才成立")
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--l1", default=None, help="L1 權重;不給則走規則路徑")
+    ap.add_argument("--encoder", default="transformer", choices=ENCODERS,
+                    help="序列編碼器。其餘結構完全固定,所以這是單一變因:"
+                         "transformer 自注意力 / gru 雙向 GRU / "
+                         "bag 不做 token 互動")
     ap.add_argument("--pose-dir", default="annotations/pose")
     ap.add_argument("--labels", default="annotations/clip_labels.json")
-    ap.add_argument("--save", default="checkpoints/hier_l2.pt")
+    ap.add_argument("--save", default=None,
+                    help="預設 checkpoints/hier_l2.pt(transformer)或 "
+                         "checkpoints/hier_l2_{encoder}.pt")
     args = ap.parse_args()
-    set_seed(42)
+    if not args.save:
+        args.save = ("checkpoints/hier_l2.pt" if args.encoder == "transformer"
+                     else f"checkpoints/hier_l2_{args.encoder}.pt")
+    set_seed(args.seed)
     device = resolve_device("auto")
 
     items = load_pose_items(args.pose_dir, args.labels)
@@ -125,6 +138,11 @@ def main():
               f"(other_neg/desk_work),裡面混著扶眼鏡與抓頭髮;"
               f"要做六分類前應該複標")
 
+    probe = CompositionNet(token_dim=ds.samples[0]["tokens"].shape[1],
+                           stat_dim=STAT_DIM, encoder=args.encoder)
+    print(f"序列編碼器:{args.encoder}(整個 L2 共 "
+          f"{count_params(probe):,} 個參數)")
+
     token_dim = ds.samples[0]["tokens"].shape[1]
     counts = np.array([max((labels == c).sum(), 1)
                        for c in range(len(DEEP_CLASSES))], float)
@@ -135,6 +153,8 @@ def main():
     criterion = nn.CrossEntropyLoss(weight=w)
 
     # 分層 k-fold(每類各自輪流分配,類別再少也不會整折缺席)
+    # 這裡寫死 42:換 --seed 是為了量「同一組 fold 上的訓練變異」,
+    # fold 跟著動的話換來的是完全不同的驗證集,兩次結果不能相減
     rng = np.random.RandomState(42)
     folds = [[] for _ in range(args.folds)]
     for c in present:
@@ -153,8 +173,8 @@ def main():
                         shuffle=True, collate_fn=collate_tokens)
         va = DataLoader(Subset(ds, val_i), batch_size=args.batch,
                         collate_fn=collate_tokens)
-        model = CompositionNet(token_dim=token_dim,
-                               stat_dim=STAT_DIM).to(device)
+        model = CompositionNet(token_dim=token_dim, stat_dim=STAT_DIM,
+                               encoder=args.encoder).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                 weight_decay=5e-2)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
@@ -216,8 +236,10 @@ def main():
     # 全量重訓存檔
     full = DataLoader(ds, batch_size=args.batch, shuffle=True,
                       collate_fn=collate_tokens)
-    model = CompositionNet(token_dim=token_dim,
-                           stat_dim=STAT_DIM).to(device)
+    # encoder 一定要跟著傳:漏掉的話 k-fold 量的是 A 架構、
+    # 存下去的卻是 B 架構,而且 metadata 還會標成 A
+    model = CompositionNet(token_dim=token_dim, stat_dim=STAT_DIM,
+                           encoder=args.encoder).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=5e-2)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
@@ -233,7 +255,8 @@ def main():
         sched.step()
     os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
     torch.save({"model": model.state_dict(), "classes": DEEP_CLASSES,
-                "token_dim": token_dim, "l1": args.l1}, args.save)
+                "token_dim": token_dim, "l1": args.l1,
+                "encoder": args.encoder, "stat_dim": STAT_DIM}, args.save)
     print(f"權重存至 {args.save}(參數量 {count_params(model):,})")
 
 

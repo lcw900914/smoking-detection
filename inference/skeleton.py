@@ -7,9 +7,15 @@
     S2 嘴部停留:距離 < near_ratio × 肩寬
     S3 放下:距離自嘴部附近明顯拉大
 
-推斷出的階段餵入既有的 StageStateMachine 檢查 S1→S2→S3 順序與
-S2 停留時長,分數與網路 cycle score 做 late fusion——
+推斷出的階段餵入 HandToMouthCounter 累積「手到嘴」事件次數,
+次數警戒分數與網路 cycle score 做 late fusion——
 可解釋(畫面直接看得到手到嘴的線)且不需階段標籤訓練。
+
+**注意計畫書寫的是餵給 StageStateMachine 檢查 S1→S2→S3 順序,那不是
+現況。** 2026-07 改成「次數警戒取代單次動作觸發」之後,順序檢查的三件事
+分散到了別處:S1 在 S2 前由本檔的 armed 機制守、S2 停留下限由 counter 的
+min_dwell 守、S3 在 S2 後只有方法 rule+order 會守。StageStateMachine 本身
+還在 inference/state_machine.py,但它的 score() 已經沒有人讀。
 """
 from collections import deque
 from typing import Optional, Tuple

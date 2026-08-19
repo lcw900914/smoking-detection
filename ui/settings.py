@@ -147,9 +147,11 @@ PARAMS: List[Tuple[str, List[Param]]] = [
         Param(("move_gate", "window_sec"), "移動統計視窗", 2, 60, 1, "秒"),
     ]),
     ("融合權重(僅外觀網路相關方法)", [
-        Param(("state_machine", "weights", "state_machine"), "規則權重",
-              0.0, 1.0, 0.1, "", "", needs="appearance"),
-        Param(("state_machine", "weights", "network"), "網路權重", 0.0, 1.0,
+        Param(("fusion", "count"), "次數權重", 0.0, 1.0, 0.1, "",
+              "手到嘴「次數警戒」分數的權重。舊版標成「規則權重」,"
+              "讓人以為乘的是狀態機的順序檢查分數——不是,一直都是次數分數",
+              needs="appearance"),
+        Param(("fusion", "network"), "網路權重", 0.0, 1.0,
               0.1, "", "", needs="appearance"),
     ]),
     ("第二階段複核(降級不否決)", [

@@ -17,6 +17,38 @@
 2. 可解釋。誤判時看得到是哪一層錯:基元時間軸畫出來,是「停留」判錯,
    還是「停留 1.2 秒 × 3 次」被組成了抽菸,一眼分得出來。
 3. 可換。抽菸/喝水的判準要調,改 L2;姿態模型換掉,只需重訓 L1。
+
+參考文獻
+────────
+本檔的兩個網路都由標準積木組成,論文裡要照實引用:
+
+L1 PrimitiveNet 的主幹
+  Yan, S., Xiong, Y., Lin, D. (2018). Spatial Temporal Graph
+  Convolutional Networks for Skeleton-Based Action Recognition.
+  AAAI 2018. https://doi.org/10.1609/aaai.v32i1.12328
+  (實作見 stage2/stgcn.py;本專案加的功能邊見 stage2/graph.py)
+
+L2 CompositionNet 的編碼器與位置編碼
+  Vaswani, A. et al. (2017). Attention Is All You Need.
+  NeurIPS 2017. arXiv:1706.03762
+
+位置編碼吃**真實秒數**而非 token 序號,這個想法也不是本專案首創:
+  Kazemi, S.M. et al. (2019). Time2Vec: Learning a Vector
+  Representation of Time. arXiv:1907.05321
+  Shukla, S.N., Marlin, B.M. (2021). Multi-Time Attention Networks
+  for Irregularly Sampled Time Series. ICLR 2021. arXiv:2101.10318
+本專案的作法是把 Vaswani 的正弦編碼直接餵秒數(週期 0.5–60 秒),
+比上面兩篇單純:沒有可學的時間嵌入,也沒有時間注意力。
+
+「原子動作 → 複合行為」這種兩層切法在時序動作分割裡有大量前作,
+主張新穎前請先查文獻,例如:
+  Abu Farha, Y., Gall, J. (2019). MS-TCN: Multi-Stage Temporal
+  Convolutional Network for Action Segmentation. CVPR 2019.
+
+**本專案自己的部分**(這些才是可以主張的):五個基元的詞彙表與
+「標籤全由幾何規則自動產生、L1 不需人標」的作法(stage2/primitives.py)、
+21 維片段屬性與 16 維節律統計(stage2/composition.py)、
+以及零參數的片段文法 grammar_scores。
 """
 import numpy as np
 import torch
@@ -120,32 +152,85 @@ def _time_sinusoid(times: torch.Tensor, dim: int) -> torch.Tensor:
     return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
 
 
+ENCODERS = ("transformer", "gru", "bag")
+
+
 class CompositionNet(nn.Module):
     """L2:淺層片段序列 → 具體動作。
 
-    Transformer 而非 GRU 的理由:片段序列很短(通常 5–30 個 token),
-    但判準是「兩兩之間像不像」(抽菸的每一口長得幾乎一樣)——
-    自注意力天生在算兩兩關係,GRU 得靠隱狀態繞。
+    序列編碼器可換(`encoder=`),**其餘全部固定** —— token 怎麼組、
+    時間怎麼編碼、怎麼池化、怎麼接統計、分類頭長什麼樣,三種選項
+    一模一樣。這樣「換編碼器」就是單一變因,比較才有意義:
+
+        transformer  自注意力 ×2 層(預設)
+        gru          雙向 GRU ×2 層,hidden = d_model/2 使輸出維度不變
+        bag          不做任何 token 之間的互動,直接送去池化
+
+    `bag` 不是湊數的:它回答「片段之間到底需不需要互動」。如果 bag 就
+    打平另外兩個,代表判別訊息全在單一片段的屬性與整段的節律統計裡,
+    那整個序列編碼器可以拆掉。這種事在資料只有幾十段時很常發生。
+
+    原本選 Transformer 的理由(現在應該用實測檢驗,不是相信它):
+    片段序列很短(通常 5–30 個 token),但判準是「兩兩之間像不像」
+    (抽菸的每一口長得幾乎一樣)——自注意力天生在算兩兩關係,
+    GRU 得靠隱狀態繞。
+
+    注意:**三種編碼器的參數量不同**(Transformer 約 17k、GRU 約 9.6k、
+    bag 為 0),比較時要一起報,不然分不出是「架構比較好」還是
+    「容量比較合適」。
     """
 
     def __init__(self, num_classes: int = len(DEEP_CLASSES),
                  token_dim: int = TOKEN_DIM, stat_dim: int = 16,
                  d_model: int = 32, nhead: int = 4, layers: int = 2,
-                 dropout: float = 0.3):
+                 dropout: float = 0.3, encoder: str = "transformer"):
         super().__init__()
+        if encoder not in ENCODERS:
+            raise ValueError(
+                f"未知的編碼器 {encoder!r};可用:{', '.join(ENCODERS)}")
         self.proj = nn.Linear(token_dim, d_model)
         self.token_norm = nn.LayerNorm(d_model)
-        enc = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 2,
-            dropout=dropout, batch_first=True, norm_first=True)
-        # norm_first 與 nested tensor 併用時 PyTorch 會自行停用後者並
-        # 發警告;序列本來就只有十幾個 token,直接關掉省事
-        self.encoder = nn.TransformerEncoder(enc, num_layers=layers,
-                                             enable_nested_tensor=False)
+        self.encoder_kind = encoder
+
+        if encoder == "transformer":
+            enc = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=nhead, dim_feedforward=d_model * 2,
+                dropout=dropout, batch_first=True, norm_first=True)
+            # norm_first 與 nested tensor 併用時 PyTorch 會自行停用後者並
+            # 發警告;序列本來就只有十幾個 token,直接關掉省事
+            self.encoder = nn.TransformerEncoder(enc, num_layers=layers,
+                                                 enable_nested_tensor=False)
+        elif encoder == "gru":
+            # hidden = d_model/2 且雙向 → 輸出仍是 d_model,
+            # 下游的池化與分類頭一行都不用改
+            if d_model % 2:
+                raise ValueError("gru 編碼器需要偶數 d_model")
+            self.encoder = nn.GRU(
+                d_model, d_model // 2, num_layers=layers, batch_first=True,
+                bidirectional=True, dropout=dropout if layers > 1 else 0.0)
+        else:
+            self.encoder = nn.Identity()
+
         self.head = nn.Sequential(
             nn.Linear(d_model + stat_dim, 48), nn.ReLU(True),
             nn.Dropout(dropout), nn.Linear(48, num_classes))
         self.d_model = d_model
+
+    def encode(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """(B,N,d) + 有效遮罩 → (B,N,d)。三種編碼器的唯一分歧點。"""
+        if self.encoder_kind == "transformer":
+            return self.encoder(x, src_key_padding_mask=~mask)
+        if self.encoder_kind == "gru":
+            # 補齊用的空位不能餵進 GRU,否則末端隱狀態被零向量洗掉;
+            # pack 的長度為 0 會直接報錯,所以下限夾 1
+            lens = mask.sum(1).clamp(min=1).to("cpu")
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x, lens, batch_first=True, enforce_sorted=False)
+            out, _ = self.encoder(packed)
+            out, _ = nn.utils.rnn.pad_packed_sequence(
+                out, batch_first=True, total_length=x.shape[1])
+            return out
+        return x
 
     def forward(self, tokens: torch.Tensor, times: torch.Tensor,
                 mask: torch.Tensor, stats: torch.Tensor,
@@ -155,7 +240,7 @@ class CompositionNet(nn.Module):
         → logits (B,C)。"""
         x = self.token_norm(self.proj(tokens)) + \
             _time_sinusoid(times, self.d_model)
-        h = self.encoder(x, src_key_padding_mask=~mask)
+        h = self.encode(x, mask)
         w = mask.float().unsqueeze(-1)
         pooled = (h * w).sum(1) / w.sum(1).clamp(min=1.0)
         z = torch.cat([pooled, stats], dim=1)

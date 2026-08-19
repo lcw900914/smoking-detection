@@ -87,10 +87,16 @@ class StageStateMachine:
         self._history.clear()
 
 
-def cycle_score(sm_score: float, net_score: float,
-                w_sm: float = 0.5, w_net: float = 0.5) -> float:
-    """單週期分數 = w_sm × 狀態機分數 + w_net × 網路 cycle score。"""
-    return w_sm * sm_score + w_net * net_score
+def cycle_score(count_score: float, net_score: float,
+                w_count: float = 0.5, w_net: float = 0.5) -> float:
+    """融合分數 = w_count × 次數警戒分數 + w_net × 網路 cycle score。
+
+    第一個參數是 **HandToMouthCounter.score()**,不是 StageStateMachine
+    的分數 —— 舊名 `w_sm` / `sm_score` 是 2026-07「次數警戒取代單次動作
+    觸發」之前留下的,一直沒改,讓人以為順序檢查有參與融合。
+    設定鍵同步從 `state_machine.weights.state_machine` 搬到 `fusion.count`。
+    """
+    return w_count * count_score + w_net * net_score
 
 
 class HandToMouthCounter:
@@ -104,13 +110,26 @@ class HandToMouthCounter:
 
     事件與上次事件間隔 ≥ min_gap 才計(避免同一口重複計數)。
     滾動視窗內:1 次 → 低(0.2)、2 次 → 中(0.5)、≥3 次 → 高(0.8)。
+
+    **require_release(方法 rule+order 用)**:再加一條「手要真的放下」。
+    預設 False 時,S2 段落只要**任何**非 S2 階段持續超過 gap_tolerance
+    就結算——包含背景與棄權,也就是「手到嘴然後手就看不見了」跟
+    「手到嘴再放下」被當成同一件事。開啟後要求 release_window 秒內
+    看得到 S3(手明顯拉遠)才計入。
+
+    這是 StageStateMachine 原本要守的「S1→S2→S3 順序」裡唯一沒有被
+    別處涵蓋的那一半(S1 那半已由 SkeletonStageEstimator 的 armed
+    機制守住)。**代價是事件的結算會延後最多 release_window 秒**:
+    結算當下還看不到未來,只能先掛起來等。
     """
 
     def __init__(self, window_sec: float = 90.0, min_dwell: float = 2.0,
                  max_dwell: Optional[float] = 5.0,
                  min_gap: float = 2.0, gap_tolerance: float = 0.5,
                  levels: Tuple[Tuple[int, float], ...] = ((1, 0.2), (2, 0.5),
-                                                          (3, 0.8))):
+                                                          (3, 0.8)),
+                 require_release: bool = False,
+                 release_window: float = 2.0):
         self.window_sec = window_sec
         self.min_dwell = min_dwell
         self.max_dwell = max_dwell            # None = 不設上限
@@ -118,6 +137,16 @@ class HandToMouthCounter:
         # 骨架偵測會斷斷續續,S2 中斷 ≤ gap_tolerance 秒視為同一次停留
         self.gap_tolerance = gap_tolerance
         self.levels = sorted(levels)          # [(次數門檻, 分數), ...]
+        # release_window 預設 2.0 秒,是量出來的不是猜的:手離開嘴之後常常
+        # 先「看不到」一兩秒(垂到桌面下、被身體擋住),骨架要再看到手往外
+        # 拉才判得出 S3。實測 64 段片段,窗口 1.0 秒會誤殺一個真的抽菸事件
+        # (那段的 S3 隔了 2.1 秒才出現);2.0 秒則 4 個真事件全保住、仍擋掉
+        # 2 個誤報事件,而且 2.0 秒之後就飽和。
+        # 下限是 gap_tolerance —— 窗口比它還小的話 S3 根本來不及被判出來,
+        # 會把**所有**事件都擋掉,而且不會有任何錯誤訊息。
+        self.require_release = require_release
+        self.release_window = release_window
+        self._pending: Optional[Tuple[float, float]] = None  # (dwell, 停留結束時間)
         self._events: Deque[float] = deque()  # 事件完成時間
         self._s2_start = None                 # 進行中的 S2 起點
         self._s2_last = None                  # 最後一次看到 S2 的時間
@@ -136,26 +165,51 @@ class HandToMouthCounter:
             if self._s2_start is None:
                 self._s2_start = timestamp
             self._s2_last = timestamp
-        elif self._s2_start is not None and \
-                timestamp - self._s2_last > self.gap_tolerance:
+        elif self._s2_start is not None and (
+                timestamp - self._s2_last > self.gap_tolerance):
             dwell = self._s2_last - self._s2_start
+            end_t = self._s2_last
             if dwell < self.min_dwell:
                 result = (dwell, False, "太短(扶眼鏡/摸臉)")
             elif self.max_dwell is not None and dwell > self.max_dwell:
                 result = (dwell, False, "太長(講電話)")
-            elif self._s2_last - self._last_event < self.min_gap:
+            elif end_t - self._last_event < self.min_gap:
                 result = (dwell, False, "與上次事件間隔不足")
+            elif self.require_release:
+                # 結算當下看不到未來:先掛起來等 S3,超時就丟掉
+                self._pending = (dwell, end_t)
             else:
-                self._events.append(self._s2_last)
-                self._last_event = self._s2_last
-                result = (dwell, True, f"計入第 {len(self._events)} 次")
+                result = self._commit(dwell, end_t)
             self._s2_start = None
             self._s2_last = None
+        # 解算等待「放下」確認的事件。**必須放在結算區塊之後**:
+        # S3 常常正好落在結算的那一幀(結算等 gap_tolerance 0.5 秒,
+        # estimator 判 S3 要跟 0.6 秒前比較,兩者幾乎同時到)。放在前面
+        # 的話這一幀的 S3 會被自己剛建立的 pending 錯過,事件白白丟掉。
+        if self._pending is not None:
+            dwell, end_t = self._pending
+            if stage_id == S3:
+                self._pending = None
+                result = self._commit(dwell, end_t)
+            elif timestamp - end_t > self.release_window:
+                self._pending = None
+                result = (dwell, False, "沒看到放下(手直接不見了)")
+
         # 移出視窗外的舊事件
         while self._events and \
                 timestamp - self._events[0] > self.window_sec:
             self._events.popleft()
         return result
+
+    def _commit(self, dwell: float, end_t: float) -> Tuple[float, bool, str]:
+        """把一段停留正式計為事件。
+
+        時間戳用**停留結束的時刻**而不是確認的時刻,否則 min_gap 與
+        滾動視窗都會被 release_window 拖著跑。
+        """
+        self._events.append(end_t)
+        self._last_event = end_t
+        return (dwell, True, f"計入第 {len(self._events)} 次")
 
     def ongoing_dwell(self, timestamp: float) -> float:
         """目前進行中的 S2 停留已持續秒數(無進行中停留回傳 0)。
@@ -185,6 +239,7 @@ class HandToMouthCounter:
         self._events.clear()
         self._s2_start = None
         self._s2_last = None
+        self._pending = None
         self._last_event = float("-inf")
 
 

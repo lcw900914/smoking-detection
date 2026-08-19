@@ -14,6 +14,13 @@
     network  外觀 CNN 時序模型      grammar     片段文法(無學習權重)
     hybrid   兩者加權融合           l1+grammar  L1 網路基元 + 片段文法
                                    l1+l2       L1 + 學習版 L2
+                                   l1+l2gru    L1 + L2(編碼器換成 GRU)
+                                   frame-gcn   單幀對照組(單幀骨架圖)
+
+**frame-gcn 是對照組,不是要拿來用的方法。** 它們只看「手舉起來」的那
+一幀、看不到時間軸,存在的意義是量出「不用時序能做到多少」,好讓
+l1+grammar / l1+l2 的分數有個參照。放進同一份清單是刻意的:論文的橫向
+比較必須同一支 GUI、同一份輸入、只換選單那一格(見上面第一段)。
 
 偵測與追蹤(YOLO / ByteTrack)是所有方法共用的前處理,不算方法的一部分。
 所以「純規則」指的是**判定規則**不含學習權重;人物框與關鍵點仍然來自
@@ -25,10 +32,31 @@ from typing import Dict, List, Optional, Tuple
 
 # stage2 權重的預設位置(檔案不存在時該方法標記為不可用)
 L1_CKPT = "checkpoints/hier_l1.pt"
-L2_CKPT = "checkpoints/hier_l2.pt"
+
+# L2 一種序列編碼器一個權重。**除了編碼器,L2 其餘結構完全相同**
+# (token 組法、時間編碼、池化、統計串接、分類頭),所以這幾格之間
+# 的差距就是編碼器造成的,不會混進別的變因。見 stage2/hier_model.py
+# 的 CompositionNet。
+L2_CKPT = {
+    "l1+l2": "checkpoints/hier_l2.pt",          # 自注意力 ×2
+    "l1+l2gru": "checkpoints/hier_l2_gru.pt",   # 雙向 GRU ×2
+}
+
+# 單幀對照組(stage2/frame_baseline.py),一種架構一個權重。
+#
+# 只掛 gcn 一格是刻意的:frame_baseline 另外實作了 mlp 架構,離線比較
+# (stage2/train_frame.py --arch mlp)還在用,但**不進選單**。理由是
+# ablation 的乾淨度:gcn 就是 L1 的 ST-GCN 拿掉時間卷積,與
+# rule+l1grammar 只差「有沒有時間軸」一個變因;mlp 換的是一整組手工
+# 特徵,多一個變因,拿它跟時序比會說不清楚差距從哪來。
+# (實測 gcn 0.661 也優於 mlp 0.609,見 docs/單幀對照組.md)
+FRAME_CKPT = {
+    "frame-gcn": "checkpoints/frame_gcn.pt",
+}
 
 STAGE1_MODES = ("rule", "network", "hybrid")
-STAGE2_MODES = (None, "grammar", "l1+grammar", "l1+l2")
+STAGE2_MODES = (None, "grammar", "l1+grammar",
+                *sorted(L2_CKPT), *sorted(FRAME_CKPT))
 
 
 @dataclass(frozen=True)
@@ -41,6 +69,7 @@ class Method:
     stage2: Optional[str]          # None / grammar / l1+grammar / l1+l2
     desc: str                      # 一行說明(GUI 狀態列)
     count_gate: bool = True        # 是否要求「手到嘴 N 次」才允許紅色警報
+    require_release: bool = False  # 事件是否要求「看得到手放下(S3)」才計入
 
     # ---- 前置需求 ----
 
@@ -58,16 +87,26 @@ class Method:
     def ckpts(self) -> Tuple[Optional[str], Optional[str]]:
         """(L1 權重, L2 權重);不需要的回 None。"""
         s2 = self.stage2
-        l1 = L1_CKPT if s2 in ("l1+grammar", "l1+l2") else None
-        l2 = L2_CKPT if s2 == "l1+l2" else None
-        return l1, l2
+        l1 = L1_CKPT if (s2 == "l1+grammar" or s2 in L2_CKPT) else None
+        return l1, L2_CKPT.get(s2)
+
+    @property
+    def frame_ckpt(self) -> Optional[str]:
+        """單幀對照組的權重;非對照組方法回 None。"""
+        return FRAME_CKPT.get(self.stage2)
+
+    @property
+    def is_frame_baseline(self) -> bool:
+        """這條路徑是不是「看不到時間軸」的單幀對照組。"""
+        return self.stage2 in FRAME_CKPT
 
     def missing(self) -> List[str]:
         """回傳缺少的 stage2 權重檔清單(空 = 可用)。
 
         外觀網路權重不列在這裡:它由使用者在 GUI 現場指定,不是固定路徑。
         """
-        return [p for p in self.ckpts if p and not Path(p).exists()]
+        need = [*self.ckpts, self.frame_ckpt]
+        return [p for p in need if p and not Path(p).exists()]
 
     @property
     def available(self) -> bool:
@@ -85,7 +124,7 @@ class Method:
 
     # ---- 套用到設定檔 ----
 
-    def apply(self, cfg: dict) -> dict:
+    def apply(self, cfg: dict) -> dict:  # noqa: D401
         """回傳依本方法調整過的推理設定(不改動傳入的 cfg)。
 
         方法自己決定要不要開骨架分支,不依賴使用者挑對設定檔——
@@ -96,6 +135,9 @@ class Method:
         skel = dict(out.get("skeleton", {}))
         skel["enabled"] = bool(self.needs_skeleton)
         out["skeleton"] = skel
+        esc = dict(out.get("escalation", {}))
+        esc["require_release"] = bool(self.require_release)
+        out["escalation"] = esc
         return out
 
 
@@ -107,6 +149,14 @@ METHODS: Tuple[Method, ...] = (
         stage1="rule", stage2=None,
         desc="腕-鼻距離判 S1/S2/S3,手到嘴次數決定警戒。判定零學習權重,"
              "門檻可現場調,誤判原因看得見。"),
+    Method(
+        key="rule+order",
+        name="純規則 + 順序檢查(要求看得到放下)",
+        stage1="rule", stage2=None, require_release=True,
+        desc="與 rule 只差一條:S2 停留必須在 2 秒內看到 S3(手明顯拉遠)"
+             "才計為一次事件。「手到嘴然後手就不見了」不算。"
+             "這是 StageStateMachine 原本要守卻沒接上線的那半條規則。"),
+
     Method(
         key="rule+grammar",
         name="純規則 + 片段文法複核",
@@ -140,6 +190,23 @@ METHODS: Tuple[Method, ...] = (
         stage1="hybrid", stage2=None,
         desc="cycle = 0.5×次數警戒 + 0.5×網路分數。實地 57 段警報幾乎全為誤報,"
              "作為改進的基準線。"),
+    # ---- 單幀對照組:看不到時間軸,量的是「不用時序能做到多少」----
+    Method(
+        key="rule+l1l2gru",
+        name="純規則 + L1 + 學習版 L2(GRU 編碼器)",
+        stage1="rule", stage2="l1+l2gru",
+        desc="與 rule+l1l2 只差一件事:L2 的序列編碼器由自注意力換成雙向 "
+             "GRU(21k → 14k 參數)。用來回答「編碼器選哪個比較好」,"
+             "其餘結構完全相同。"),
+
+    Method(
+        key="rule+frame_gcn",
+        name="純規則 + 單幀對照組(單幀骨架圖)",
+        stage1="rule", stage2="frame-gcn",
+        desc="對照組:只看「手舉起來」的單幀 13 節點骨架圖,每幀各判一次"
+             "再取 top-k 平均。就是 L1 的 ST-GCN 拿掉時間卷積,與"
+             "rule+l1grammar 只差「有沒有時間軸」。是拿來比的,不是拿來用的。"),
+
     Method(
         key="hybrid+l1grammar",
         name="外觀網路 + 規則 + L1 + 片段文法",

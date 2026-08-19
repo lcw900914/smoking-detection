@@ -1,4 +1,16 @@
-"""ByteTrack 多目標追蹤 wrapper(使用 supervision 套件實作)。"""
+"""ByteTrack 多目標追蹤 wrapper(使用 supervision 套件實作)。
+
+參考文獻
+────────
+  Zhang, Y., Sun, P., Jiang, Y., Yu, D., Weng, F., Yuan, Z., Luo, P.,
+  Liu, W., Wang, X. (2022). ByteTrack: Multi-Object Tracking by
+  Associating Every Detection Box. ECCV 2022.
+  https://doi.org/10.1007/978-3-031-20047-2_1
+
+本專案只是呼叫 supervision 的實作,沒有改動演算法。追蹤在這裡是
+**感測器**不是判定器——它決定「這幾幀是同一個人」,不決定「這個人
+在不在抽菸」(見 inference/methods.py 開頭)。
+"""
 from typing import List, Tuple
 
 import numpy as np

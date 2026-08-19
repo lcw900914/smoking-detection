@@ -125,7 +125,16 @@ class SecondStageVerifier:
     mode 對應 `inference/methods.py` 的 stage2 欄位:
         grammar      規則基元 + 片段文法(零學習權重)
         l1+grammar   L1 網路基元 + 片段文法
-        l1+l2        L1 + 學習版 L2
+        l1+l2        L1 + 學習版 L2(自注意力編碼器)
+        l1+l2gru     L1 + 學習版 L2(GRU 編碼器)
+        frame-mlp    單幀對照組:運動學 MLP
+        frame-gcn    單幀對照組:單幀骨架圖
+
+    frame-* 走 `stage2.frame_baseline.FrameRecognizer`,其餘走
+    `stage2.infer_hier.HierarchicalRecognizer`。兩者的 `predict()` 回傳
+    形狀相同,所以這個類別除了建構子之外一行都不必分歧——降級不否決的
+    邏輯(`decide`)對兩者完全一樣,對照組才不會因為判定規則不同而
+    佔便宜或吃虧。
 
     模型在第一次呼叫 `verify()` 時才載入(lazy):選純規則方法的人不該
     為了一個用不到的 ST-GCN 等 torch 暖機。
@@ -135,12 +144,20 @@ class SecondStageVerifier:
                  l2_ckpt: Optional[str] = None, device: str = "auto",
                  min_smoking: float = MIN_SMOKING,
                  min_valid_ratio: float = MIN_VALID_RATIO,
-                 min_span_sec: float = MIN_SPAN_SEC):
-        if mode not in ("grammar", "l1+grammar", "l1+l2"):
+                 min_span_sec: float = MIN_SPAN_SEC,
+                 frame_ckpt: Optional[str] = None):
+        known = ("grammar", "l1+grammar")
+        if (mode not in known and not mode.startswith("frame-")
+                and not mode.startswith("l1+l2")):
             raise ValueError(f"未知的複核模式 {mode!r}")
+        if mode.startswith("frame-") and not frame_ckpt:
+            raise ValueError(f"複核模式 {mode!r} 需要 frame_ckpt")
         self.mode = mode
-        self.l1_ckpt = l1_ckpt if mode in ("l1+grammar", "l1+l2") else None
-        self.l2_ckpt = l2_ckpt if mode == "l1+l2" else None
+        self.is_frame = mode.startswith("frame-")
+        self.frame_ckpt = frame_ckpt if self.is_frame else None
+        self.l1_ckpt = (l1_ckpt if mode == "l1+grammar"
+                        or mode.startswith("l1+l2") else None)
+        self.l2_ckpt = l2_ckpt if mode.startswith("l1+l2") else None
         self.device = device
         self.min_smoking = min_smoking
         self.min_valid_ratio = min_valid_ratio
@@ -150,10 +167,15 @@ class SecondStageVerifier:
     @property
     def recognizer(self):
         if self._rec is None:
-            from stage2.infer_hier import HierarchicalRecognizer
-            self._rec = HierarchicalRecognizer(
-                l1_ckpt=self.l1_ckpt, l2_ckpt=self.l2_ckpt,
-                device=self.device)
+            if self.is_frame:
+                from stage2.frame_baseline import FrameRecognizer
+                self._rec = FrameRecognizer(self.frame_ckpt,
+                                            device=self.device)
+            else:
+                from stage2.infer_hier import HierarchicalRecognizer
+                self._rec = HierarchicalRecognizer(
+                    l1_ckpt=self.l1_ckpt, l2_ckpt=self.l2_ckpt,
+                    device=self.device)
         return self._rec
 
     def verify(self, kpts: np.ndarray, fps: float = 10.0,
@@ -174,7 +196,10 @@ class SecondStageVerifier:
         status, reason = decide(
             out["scores"], valid, span,
             self.min_smoking, self.min_valid_ratio, self.min_span_sec)
-        detail = explain(a.segments, a.stats, out["scores"])
+        # 對照組的分數不是片段文法算的,印片段時間軸會誤導看的人;
+        # 讓它自己說明自己是怎麼判的
+        detail = (self.recognizer.explain(kpts, fps) if self.is_frame
+                  else explain(a.segments, a.stats, out["scores"]))
         head = (f"複核模式:{self.mode}   序列 {span:.1f}s   "
                 f"骨架有效 {valid:.0%}")
         return VerifyResult(
@@ -196,6 +221,7 @@ def build(method, cfg: Optional[dict] = None) -> Optional[SecondStageVerifier]:
     l1, l2 = method.ckpts
     return SecondStageVerifier(
         method.stage2, l1_ckpt=l1, l2_ckpt=l2,
+        frame_ckpt=method.frame_ckpt,
         device=v.get("device", "auto"),
         min_smoking=float(v.get("min_smoking", MIN_SMOKING)),
         min_valid_ratio=float(v.get("min_valid_ratio", MIN_VALID_RATIO)),

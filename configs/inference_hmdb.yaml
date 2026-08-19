@@ -105,12 +105,26 @@ roi:
   jump_threshold: 0.5     # 框中心跳動超過(相對框對角線)視為異常,沿用前一幀平滑框
   out_size: 224
 
-state_machine:
-  window_sec: 8.0         # 滑動檢查視窗
-  s2_min_dwell: 0.8       # S2 最短停留秒數
-  weights:                # 單週期分數 = w_sm * 狀態機分數 + w_net * 網路 cycle score
-    state_machine: 0.4    # 骨架規則驅動狀態機(S1→S2→S3 順序 + S2 dwell)
-    network: 0.6          # 喝水也有手到嘴動作,骨架權重略低於網路
+state_machine:            # ⚠ 這兩個目前**不影響任何行為**。
+                          # StageStateMachine 每幀被 push(),但它的 score()
+                          # 在 pipeline 與 GUI 裡從來沒有被呼叫過(只有測試在用)
+                          # —— 它是 2026-07「次數警戒取代單次動作觸發」之前
+                          # 的舊機制,被 HandToMouthCounter 取代後沒清乾淨。
+                          # 它原本要守的三件事現在都有人守了:
+                          #   S1 在 S2 前 → SkeletonStageEstimator 的 armed 機制
+                          #   S2 停留下限 → escalation.min_dwell(2.0,更嚴)
+                          #   S3 在 S2 後 → 方法 rule+order(require_release)
+                          # 待 rule+order 有定論後連同這個區塊一起移除。
+  window_sec: 8.0         # (無效果)滑動檢查視窗
+  s2_min_dwell: 0.8       # (無效果)S2 最短停留秒數
+
+fusion:                   # 融合分數(只有 hybrid 家族會用)
+  count: 0.4                # 手到嘴「次數警戒」分數的權重
+    # 喝水也有手到嘴動作,骨架權重略低於網路
+  network: 0.6              # 外觀網路 cycle score 的權重
+                          # ⚠ 舊版把這兩個放在 state_machine.weights 底下,
+                          #   名字讓人以為是狀態機分數的權重 —— 不是。
+                          #   第一項乘的一直都是 HandToMouthCounter 的分數
 
 alarm:
   ema_alpha: 0.9          # P_t = 0.9 * P_{t-1} + 0.1 * cycle_score

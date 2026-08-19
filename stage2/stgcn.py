@@ -7,6 +7,24 @@
 
 另外掛一個可學的**邊重要性遮罩**:拓樸給的是「哪些邊存在」,遮罩學的是
 「哪些邊重要」。抽菸這種任務期待它把腕-鼻那條功能邊的權重養大。
+
+參考文獻
+────────
+這個模組是 ST-GCN 的重寫實作,不是本專案的原創:
+
+  Yan, S., Xiong, Y., Lin, D. (2018).
+  Spatial Temporal Graph Convolutional Networks for Skeleton-Based
+  Action Recognition. AAAI 2018.
+  https://doi.org/10.1609/aaai.v32i1.12328
+  官方實作:https://github.com/yysijie/st-gcn
+
+直接沿用那篇的兩個機制:
+  · spatial configuration partitioning —— 把鄰居依「到中心的跳數」
+    分成自身 / 向心 / 離心三區,每區獨立權重(SpatialGraphConv)
+  · learnable edge importance weighting —— 拓樸決定哪些邊存在,
+    可學遮罩決定哪些邊重要(SpatialGraphConv.edge_mask)
+
+與原文不同的地方寫在 stage2/graph.py(節點子集與功能邊)。
 """
 import torch
 import torch.nn as nn

@@ -15,6 +15,28 @@
   FUNCTIONAL 功能邊——腕↔鼻、腕↔耳、腕↔腕。這幾條不是骨頭,但正是
     本任務的判別關係(手到嘴 / 手到耳)。加進圖裡,訊息一步就能傳到,
     不必靠腕→肘→肩→頸→鼻繞四層。
+
+參考文獻與本專案的改動
+──────────────────────
+分區鄰接矩陣(build_adjacency)的作法來自:
+
+  Yan, S., Xiong, Y., Lin, D. (2018).
+  Spatial Temporal Graph Convolutional Networks for Skeleton-Based
+  Action Recognition. AAAI 2018.
+  https://doi.org/10.1609/aaai.v32i1.12328
+
+**FUNCTIONAL_EDGES 不是那篇的東西。** 原文的圖只有解剖邊(骨頭連接);
+腕↔鼻、腕↔耳、腕↔眼、腕↔腕這幾條是為了「手到臉」這一類動作加的,
+屬於本專案的任務特化設計,寫論文時要說清楚是自己加的。
+
+另一條路是讓網路自己學鄰接,而不是手工加邊:
+
+  Shi, L., Zhang, Y., Cheng, J., Lu, H. (2019).
+  Two-Stream Adaptive Graph Convolutional Networks for Skeleton-Based
+  Action Recognition. CVPR 2019. arXiv:1805.07694
+
+本專案選手工加邊而非學習式鄰接,理由是資料量:幾十段片段學不出
+「腕該連到鼻」這種先驗,直接寫進圖裡是免費的歸納偏置。
 """
 from typing import List, Tuple
 

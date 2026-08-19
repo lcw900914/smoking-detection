@@ -44,6 +44,41 @@ class TestRegistry:
         for m in reg.METHODS:
             assert reg.by_name(m.name) is m
 
+    def test_frame_baseline_is_in_the_list(self):
+        """單幀對照組必須掛在同一份清單上。
+
+        論文的橫向比較要求同一支 GUI、同一份輸入、只換選單那一格。
+        對照組另開一支腳本跑就沒有這個保證了。
+        """
+        assert "rule+frame_gcn" in reg.keys()
+
+    def test_only_the_clean_ablation_is_exposed(self):
+        """選單上只掛 gcn 一格。
+
+        frame_baseline 另外實作了 mlp,離線比較還在用,但不進選單:
+        它換掉的是一整組手工特徵,與時序比會多一個變因。掛上去之後
+        「單幀 vs 時序」的差距就講不清楚是時間軸還是特徵造成的。
+        """
+        assert set(reg.FRAME_CKPT) == {"frame-gcn"}
+        assert sum(1 for m in reg.METHODS if m.is_frame_baseline) == 1
+
+    def test_frame_methods_declare_their_ckpt(self):
+        for m in reg.METHODS:
+            if m.is_frame_baseline:
+                assert m.frame_ckpt, m.key
+                assert m.frame_ckpt in reg.FRAME_CKPT.values()
+            else:
+                assert m.frame_ckpt is None, m.key
+
+    def test_frame_methods_need_skeleton_and_are_not_ai_free(self):
+        """對照組吃骨架、而且含學習權重——這兩個旗標錯了,GUI 會關掉
+        pose 分支或把它標成「零學習權重」,兩種都是假的。"""
+        for m in reg.METHODS:
+            if m.is_frame_baseline:
+                assert m.needs_skeleton, m.key
+                assert not m.ai_free_decision, m.key
+                assert not m.needs_appearance, m.key
+
     def test_default_is_rule_only(self):
         """預設走純規則:它不需要任何權重,換機器就能跑。"""
         assert reg.default().ai_free_decision
@@ -65,7 +100,19 @@ class TestRegistry:
         assert reg.get("rule").ckpts == (None, None)
         assert reg.get("rule+grammar").ckpts == (None, None)
         assert reg.get("rule+l1grammar").ckpts == (reg.L1_CKPT, None)
-        assert reg.get("rule+l1l2").ckpts == (reg.L1_CKPT, reg.L2_CKPT)
+        for key, mode in (("rule+l1l2", "l1+l2"),
+                          ("rule+l1l2gru", "l1+l2gru")):
+            assert reg.get(key).ckpts == (reg.L1_CKPT, reg.L2_CKPT[mode])
+
+    def test_每個_l2_編碼器各有自己的權重檔(self):
+        """兩格共用一個權重檔的話,訓練完 GRU 會覆蓋掉 Transformer,
+        選單上還是兩格但其實是同一個模型 —— 而且看不出來。"""
+        paths = list(reg.L2_CKPT.values())
+        assert len(paths) == len(set(paths))
+        for m in reg.METHODS:
+            if m.stage2 in reg.L2_CKPT:
+                assert m.ckpts[1] == reg.L2_CKPT[m.stage2], m.key
+                assert m.ckpts[0] == reg.L1_CKPT, m.key
 
     def test_grammar_methods_never_need_weights(self):
         """無學習權重的方法必須永遠可用,不然「換機器就能跑」是假的。"""

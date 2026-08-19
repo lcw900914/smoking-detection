@@ -21,9 +21,9 @@ from typing import Optional
 import numpy as np
 import torch
 
-from stage2.composition import (Analysis, analyze, explain, grammar_scores,
-                                normalize_stats)
-from stage2.hier_model import CompositionNet, PrimitiveNet
+from stage2.composition import (STAT_DIM, Analysis, analyze, explain,
+                                grammar_scores, normalize_stats)
+from stage2.hier_model import TOKEN_DIM, CompositionNet, PrimitiveNet
 from stage2.kinematics import graph_features, kinematic_features
 from stage2.taxonomy import DEEP_CLASSES, DEEP_NAMES
 from utils import resolve_device
@@ -47,12 +47,18 @@ class HierarchicalRecognizer:
         if l2_ckpt:
             ck = torch.load(l2_ckpt, map_location=self.device,
                             weights_only=False)
+            # token_dim 與 encoder 一定要從權重檔讀回來,不能吃預設值:
+            # 沒有 L1 時 token 少了 16 維嵌入(44 → 28),用預設值建出來的
+            # 網路形狀對不上;encoder 更是直接決定有哪些權重。
             self.l2 = CompositionNet(
-                num_classes=len(ck.get("classes", DEEP_CLASSES))).to(
-                self.device)
+                num_classes=len(ck.get("classes", DEEP_CLASSES)),
+                token_dim=int(ck.get("token_dim", TOKEN_DIM)),
+                stat_dim=int(ck.get("stat_dim", STAT_DIM)),
+                encoder=ck.get("encoder", "transformer")).to(self.device)
             self.l2.load_state_dict(ck["model"])
             self.l2.eval()
             self.l2_classes = ck.get("classes", DEEP_CLASSES)
+            self.l2_encoder = ck.get("encoder", "transformer")
 
     # ---- 淺層 ----
 
